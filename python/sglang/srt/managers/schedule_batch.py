@@ -1896,6 +1896,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            tree_sparse_fill_ids=(
+                [list(r.fill_ids) for r in self.reqs]
+                if not self.forward_mode.is_decode_or_idle()
+                and get_global_server_args().enable_tree_sparse
+                else None
+            ),
         )
 
     def copy(self):
@@ -1994,6 +2000,9 @@ class ModelWorkerBatch:
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None
+
+    # For tree sparse attention
+    tree_sparse_fill_ids: Optional[List[List[int]]] = None
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None

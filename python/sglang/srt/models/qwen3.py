@@ -170,6 +170,20 @@ class Qwen3Attention(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
+        # Extract W_k for optimized centroid computation (tree_sparse backend)
+        # QKV weight is [hidden_size, (q_size + 2*kv_size)]
+        # Split: [q_part | k_part | v_part]
+        W_k = None
+        if hasattr(forward_batch, "attn_backend") and hasattr(
+            forward_batch.attn_backend, "centroid_manager"
+        ):
+            # Tree sparse backend - extract K projection weight
+            qkv_weight = self.qkv_proj.weight  # [q_size + 2*kv_size, hidden_size]
+            # K portion starts after Q
+            k_start = self.q_size
+            k_end = self.q_size + self.kv_size
+            W_k = qkv_weight[k_start:k_end, :].t()  # [hidden_size, kv_size]
+
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
@@ -179,7 +193,9 @@ class Qwen3Attention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(
+            q, k, v, forward_batch, hidden_states=hidden_states, W_k=W_k
+        )
         output, _ = self.o_proj(attn_output)
         return output
 

@@ -297,6 +297,9 @@ class ForwardBatch:
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    # For tree sparse attention
+    tree_sparse_token_ids: Optional[List[List[int]]] = None
+
     # For DP attention
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
@@ -381,6 +384,7 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            tree_sparse_token_ids=getattr(batch, "tree_sparse_fill_ids", None),
         )
         device = model_runner.device
 
