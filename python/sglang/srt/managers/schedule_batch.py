@@ -2324,6 +2324,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            tree_sparse_fill_ids=(
+                [list(r.fill_ids) for r in self.reqs]
+                if not self.forward_mode.is_decode_or_idle()
+                and get_global_server_args().enable_tree_sparse
+                else None
+            ),
         )
 
     def copy(self):
@@ -2510,6 +2516,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # For tree sparse attention
+    tree_sparse_fill_ids: Optional[List[List[int]]] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

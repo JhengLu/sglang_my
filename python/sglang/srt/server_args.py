@@ -143,6 +143,8 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_amx",
     "ascend",
     "intel_xpu",
+    # Sparse attention
+    "tree_sparse",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
@@ -578,6 +580,15 @@ class ServerArgs:
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
     dllm_algorithm_config: Optional[str] = None
+
+    # Tree Sparse Attention
+    enable_tree_sparse: bool = False
+    tree_sparse_top_k: int = 8
+    tree_sparse_min_seq_len: int = 512
+    tree_sparse_min_chunk_size: int = 16
+    tree_sparse_max_chunk_size: int = 256
+    tree_sparse_recent_tokens: int = 128
+    tree_sparse_full_prefill: bool = False
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -5166,6 +5177,43 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dllm_algorithm_config,
             help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+        )
+
+        # Tree Sparse Attention
+        parser.add_argument(
+            "--enable-tree-sparse",
+            action="store_true",
+            help="Enable tree-based sparse attention for structured (HTML/ChatML) inputs.",
+        )
+        parser.add_argument(
+            "--tree-sparse-top-k",
+            type=int,
+            default=ServerArgs.tree_sparse_top_k,
+            help="Number of top-k chunks to select in tree sparse attention.",
+        )
+        parser.add_argument(
+            "--tree-sparse-min-seq-len",
+            type=int,
+            default=ServerArgs.tree_sparse_min_seq_len,
+            help="Minimum sequence length to activate sparse attention (shorter sequences use full attention).",
+        )
+        parser.add_argument(
+            "--tree-sparse-min-chunk-size",
+            type=int,
+            default=ServerArgs.tree_sparse_min_chunk_size,
+            help="Minimum chunk size for tree leaf nodes.",
+        )
+        parser.add_argument(
+            "--tree-sparse-max-chunk-size",
+            type=int,
+            default=ServerArgs.tree_sparse_max_chunk_size,
+            help="Maximum chunk size for tree leaf nodes.",
+        )
+        parser.add_argument(
+            "--tree-sparse-recent-tokens",
+            type=int,
+            default=ServerArgs.tree_sparse_recent_tokens,
+            help="Number of recent tokens always included in sparse attention.",
         )
 
         # Double Sparsity

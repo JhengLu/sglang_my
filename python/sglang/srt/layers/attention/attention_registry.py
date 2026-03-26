@@ -84,6 +84,13 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 
+@register_attention_backend("tree_sparse")
+def create_tree_sparse_backend(runner):
+    from sglang.srt.layers.attention.tree_sparse_backend import TreeSparseAttnBackend
+
+    return TreeSparseAttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (

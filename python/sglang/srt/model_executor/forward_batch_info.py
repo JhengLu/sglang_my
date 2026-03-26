@@ -370,6 +370,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     token_to_kv_pool: KVCache = None
     attn_backend: AttentionBackend = None
 
+    # For tree sparse attention
+    tree_sparse_token_ids: Optional[List[List[int]]] = None
+
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
@@ -478,6 +481,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            tree_sparse_token_ids=getattr(batch, "tree_sparse_fill_ids", None),
         )
         device = model_runner.device
 
