@@ -178,6 +178,9 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        t = getattr(forward_batch, "decode_timer", None)
+        lid = self.attn.layer_id
+
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
@@ -191,6 +194,7 @@ class Qwen3Attention(nn.Module):
             k_end = self.q_size + self.kv_size
             W_k = qkv_weight[k_start:k_end, :].t()
 
+        if t: t.start(f"L{lid}:qkv_proj")
         if (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -205,15 +209,20 @@ class Qwen3Attention(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+        if t: t.stop(f"L{lid}:qkv_proj")
 
         if get_global_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
+        # attn → backend forward_decode (kv_cache_save, kv_cache_load, attention already timed there)
         attn_output = self.attn(
             q, k, v, forward_batch, hidden_states=hidden_states, W_k=W_k
         )
+
+        if t: t.start(f"L{lid}:o_proj")
         output, _ = self.o_proj(attn_output)
+        if t: t.stop(f"L{lid}:o_proj")
         return output
 
 
@@ -293,13 +302,19 @@ class Qwen3DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        t = getattr(forward_batch, "decode_timer", None)
+        lid = self.self_attn.attn.layer_id
+
         # Self Attention
+        if t: t.start(f"L{lid}:input_ln")
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             post_residual_addition=post_residual_addition,
         )
+        if t: t.stop(f"L{lid}:input_ln")
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -308,6 +323,7 @@ class Qwen3DecoderLayer(nn.Module):
             )
 
         # Fully Connected
+        if t: t.start(f"L{lid}:post_attn_ln")
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states,
             residual,
@@ -323,7 +339,12 @@ class Qwen3DecoderLayer(nn.Module):
                 else None
             ),
         )
+        if t: t.stop(f"L{lid}:post_attn_ln")
+
+        if t: t.start(f"L{lid}:mlp")
         hidden_states = self.mlp(hidden_states)
+        if t: t.stop(f"L{lid}:mlp")
+
         if _is_npu and get_cmo_stream():
             wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(

@@ -1123,6 +1123,13 @@ class FlashAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
+        # Quest sparse attention: construct page representations during prefill
+        sparse_coord = forward_batch.sparse_coordinator
+        if sparse_coord is not None:
+            sparse_coord.attention_end(
+                output=o, layer=layer, forward_batch=forward_batch
+            )
+
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
@@ -1273,6 +1280,21 @@ class FlashAttentionBackend(AttentionBackend):
                                 metadata.page_table
                             )
                         )
+
+                # Quest sparse attention: modify metadata to select top-k pages
+                sparse_coord = forward_batch.sparse_coordinator
+                if sparse_coord is not None:
+                    metadata = sparse_coord.attention_begin(
+                        query=q,
+                        key=k,
+                        value=v,
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        attn_metadata=metadata,
+                    )
+                    # Re-read metadata fields after sparse modification
+                    page_table = metadata.page_table
+
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
@@ -1405,6 +1427,13 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 o = result
+
+        # Quest sparse attention: update page representations after attention
+        sparse_coord = forward_batch.sparse_coordinator
+        if sparse_coord is not None:
+            sparse_coord.attention_end(
+                output=o, layer=layer, forward_batch=forward_batch
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

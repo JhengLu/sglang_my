@@ -340,6 +340,7 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.sparse_coordinator = None  # For Quest on MHA models
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -805,7 +806,14 @@ class Scheduler(
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.set_decode_producer_stream(
+                    self.forward_stream
+                )
+            # For MHA models, use SparseCoordinator instead
+            self.sparse_coordinator = (
+                self.tp_worker.model_runner.sparse_coordinator
+            )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -1298,8 +1306,29 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # Scheduler timing: capture full iteration
+                if not hasattr(self, "_sched_timer"):
+                    try:
+                        _mr = self.tp_worker.model_runner
+                        _ab = getattr(_mr, "attn_backend", None)
+                        self._sched_timer = getattr(_ab, "decode_timer", None)
+                    except Exception:
+                        self._sched_timer = None
+
+                _t = self._sched_timer
+                _is_decode = _t and batch.forward_mode.is_decode()
+                if _is_decode:
+                    _t.start("sched:run_batch")
                 result = self.run_batch(batch)
+                if _is_decode:
+                    _t.stop("sched:run_batch")
+
+                if _is_decode:
+                    _t.start("sched:process_result")
                 self.process_batch_result(batch, result)
+                if _is_decode:
+                    _t.stop("sched:process_result")
+                    _t.finish_step()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
@@ -1340,10 +1369,42 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                # Scheduler timing (shared init with event_loop_normal)
+                if not hasattr(self, "_sched_timer"):
+                    try:
+                        _mr = self.tp_worker.model_runner
+                        _ab = getattr(_mr, "attn_backend", None)
+                        self._sched_timer = getattr(_ab, "decode_timer", None)
+                    except Exception:
+                        self._sched_timer = None
+
+                _t = self._sched_timer
+                _is_decode = _t and batch.forward_mode.is_decode()
+                if _is_decode:
+                    # Measure wall-clock decode-to-decode time (≈ ITL)
+                    # Only record if the PREVIOUS iteration was also decode
+                    # (skip gaps caused by prefill/idle iterations)
+                    import time as _time
+                    _now = _time.perf_counter()
+                    _prev = getattr(self, "_prev_decode_wall", 0.0)
+                    _prev_was_decode = getattr(
+                        self, "_prev_was_decode", False
+                    )
+                    if _prev > 0 and _prev_was_decode:
+                        _t._history["sched:loop_wall"].append(
+                            (_now - _prev) * 1000
+                        )
+                    self._prev_decode_wall = _now
+                    _t.start("sched:run_batch")
                 batch_result = self.run_batch(batch)
+                if _is_decode:
+                    _t.stop("sched:run_batch")
+                    _t.finish_step()
+                self._prev_was_decode = _is_decode
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+                self._prev_was_decode = False
                 self.cancel_bubble_timer()
 
             # Process the last batch
@@ -2145,7 +2206,7 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        if self.enable_hisparse:
+        if self.enable_hisparse and self.hisparse_coordinator is not None:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -2545,7 +2606,7 @@ class Scheduler(
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
-                if self.enable_hisparse:
+                if self.enable_hisparse and self.hisparse_coordinator is not None:
                     self.hisparse_coordinator.retract_req(req)
         else:
             self.new_token_ratio = max(
@@ -3102,7 +3163,7 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if self.enable_hisparse:
+                if self.enable_hisparse and self.hisparse_coordinator is not None:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index

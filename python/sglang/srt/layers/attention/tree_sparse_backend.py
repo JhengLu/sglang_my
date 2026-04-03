@@ -21,7 +21,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.tree_sparse.centroid_manager import CentroidManager
+from sglang.srt.layers.attention.tree_sparse.decode_timer import DecodeStepTimer
 from sglang.srt.layers.attention.tree_sparse.kernels import (
+    batch_sparse_select_and_build_indices,
     gpu_select_and_build_indices,
 )
 from sglang.srt.layers.attention.tree_sparse.sparse_selector import (
@@ -114,6 +116,18 @@ class TreeSparseAttnBackend(AttentionBackend):
         self.enable_sparse_prefill = not getattr(
             server_args, "tree_sparse_full_prefill", False
         )
+        self.shared_selection = getattr(
+            server_args, "tree_sparse_shared_selection", False
+        )
+
+        # Cached sparse indices for shared-selection mode (computed at layer 0, reused by all layers)
+        self._shared_sparse_indices = None  # Set per decode step
+        self._shared_needs_sparse = None  # Whether sparse is active this step
+
+        # Cached validation for centroid updates (computed at layer 0, reused by all layers)
+        self._cached_valid_batch_indices = None  # Batch indices of registered requests
+        self._cached_valid_req_pool_indices = None  # Req pool indices of registered requests
+        self._cached_validation_batch_size = -1  # Track batch size for cache invalidation
 
         # Tokenizer for decoding token IDs to text (lazy-loaded)
         self._tokenizer = None
@@ -210,11 +224,16 @@ class TreeSparseAttnBackend(AttentionBackend):
             self.max_context_len, dtype=torch.bool, device=self.device
         )
 
+        # Decode step timer (enable with TREE_SPARSE_TIMING=1)
+        self.decode_timer = DecodeStepTimer(num_layers=self.num_layers)
+
+        selection_mode = "shared (layer-0 for all)" if self.shared_selection else "per-layer"
         logger.info(
             f"TreeSparseAttnBackend initialized: top_k={self.top_k_chunks}, "
             f"min_seq_len={self.min_seq_len_for_sparse}, "
             f"chunk_size=[{self.min_chunk_size}, {self.max_chunk_size}], "
-            f"recent={self.always_include_recent}"
+            f"recent={self.always_include_recent}, "
+            f"selection={selection_mode}"
         )
 
     @property
@@ -340,6 +359,8 @@ class TreeSparseAttnBackend(AttentionBackend):
         Plans the decode wrapper with FULL indices as the default.
         Sparse re-planning happens once on layer 0 in forward_decode (shared across all layers).
         """
+        self.decode_timer.start("init_metadata")
+
         # Clean up stale requests
         active_reqs = set(forward_batch.req_pool_indices.tolist())
         self.centroid_manager.cleanup_stale(active_reqs)
@@ -348,6 +369,9 @@ class TreeSparseAttnBackend(AttentionBackend):
         # Cache batch info as Python lists to avoid .item() GPU-CPU syncs in forward_decode
         self._decode_req_pool_indices = forward_batch.req_pool_indices.tolist()
         self._decode_seq_lens = forward_batch.seq_lens.tolist()
+
+        # Invalidate validation cache for new decode step (will be recomputed at layer 0)
+        self._cached_validation_batch_size = -1
 
         # Plan decode wrapper with full indices (default for non-sparse or layer 0 override)
         bs = forward_batch.batch_size
@@ -385,6 +409,8 @@ class TreeSparseAttnBackend(AttentionBackend):
         self.forward_metadata = TreeSparseDecodeMetadata(
             decode_wrapper=self.decode_wrapper,
         )
+
+        self.decode_timer.stop("init_metadata")
 
     def _register_request_tree(
         self, forward_batch: ForwardBatch, batch_idx: int, req_pool_idx: int
@@ -674,12 +700,14 @@ class TreeSparseAttnBackend(AttentionBackend):
             batch_kv_indices, forward_batch.batch_size, str(self.device)
         )
 
-        # Build qo_indptr for query tokens
-        qo_indptr = torch.zeros(
-            forward_batch.batch_size + 1, dtype=torch.int32, device=self.device
-        )
-        for i, qo_len in enumerate(batch_qo_lens):
-            qo_indptr[i + 1] = qo_indptr[i] + qo_len
+        # Build qo_indptr for query tokens (cumulative sum on GPU)
+        if len(batch_qo_lens) > 0:
+            # Create tensor on device directly and compute cumsum
+            qo_lens_tensor = torch.tensor(batch_qo_lens, dtype=torch.int32, device=self.device)
+            qo_indptr = torch.zeros(len(batch_qo_lens) + 1, dtype=torch.int32, device=self.device)
+            qo_indptr[1:] = torch.cumsum(qo_lens_tensor, dim=0)
+        else:
+            qo_indptr = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         # Step 5: Run sparse attention using paged wrapper
         metadata.prefill_wrapper_paged.begin_forward(
@@ -763,7 +791,8 @@ class TreeSparseAttnBackend(AttentionBackend):
                 # Optimized: project only centroids (O(num_chunks) projections)
                 # hs_prefix_offset tells centroid_manager that hidden_states[0]
                 # corresponds to token position prefix_len (not position 0)
-                self.centroid_manager.update_centroids_from_hidden_states(
+                # Use batched version for better performance with scatter operations
+                self.centroid_manager.update_centroids_from_hidden_states_batched(
                     req_pool_idx=req_pool_idx,
                     layer_id=layer.layer_id,
                     hidden_states=req_hidden,
@@ -785,22 +814,277 @@ class TreeSparseAttnBackend(AttentionBackend):
         **kwargs,
     ):
         """
-        Forward decode with per-layer GPU kernel-based sparse selection.
+        Forward decode with sparse selection.
 
-        Each layer independently selects top-k chunks using GPU-native ops:
-        - Scoring: torch.einsum + topk (GPU tensors, no Python loops)
-        - Index building: Triton kernel for mask + torch.nonzero
-        - Re-planning: begin_forward per layer (unavoidable with FlashInfer)
+        Two modes controlled by self.shared_selection:
+        - Per-layer (default): each layer independently selects top-k chunks
+        - Shared: layer 0 computes indices once, all layers reuse them
         """
+        lid = layer.layer_id
+        t = self.decode_timer
+
         # Save KV cache
+        t.start(f"L{lid}:kv_cache_save")
         cache_loc = forward_batch.out_cache_loc
         if k is not None and save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
+        t.stop(f"L{lid}:kv_cache_save")
 
         bs = forward_batch.batch_size
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        if self.shared_selection:
+            o = self._forward_decode_shared(q_reshaped, layer, forward_batch, k, save_kv_cache)
+        else:
+            o = self._forward_decode_per_layer(q_reshaped, layer, forward_batch, k, save_kv_cache)
+
+        # Centroid update: only layer 0 needs this (last chunk is always included,
+        # so centroid updates are skipped during decode via early return)
+        if save_kv_cache and k is not None and layer.layer_id == 0:
+            t.start(f"L{lid}:centroid_update")
+            valid_batch_indices = []
+            valid_req_pool_indices = []
+            for i in range(bs):
+                req_pool_idx = self._decode_req_pool_indices[i]
+                if req_pool_idx in self._registered_reqs:
+                    valid_batch_indices.append(i)
+                    valid_req_pool_indices.append(req_pool_idx)
+
+            if valid_req_pool_indices:
+                valid_keys = k[valid_batch_indices]
+                self.centroid_manager.update_centroids_batched(
+                    req_pool_indices=valid_req_pool_indices,
+                    layer_id=layer.layer_id,
+                    new_keys=valid_keys,
+                    chunk_ids=[-1] * len(valid_req_pool_indices),
+                )
+            t.stop(f"L{lid}:centroid_update")
+
+        # Periodic stats logging (only on last layer to count once per decode step)
+        if layer.layer_id == self.num_layers - 1:
+            self._decode_step_count += 1
+            if self._decode_step_count % self._log_interval == 0:
+                mode_str = "shared" if self.shared_selection else "per-layer"
+                if self._sparse_layer_count > 0:
+                    avg_sparsity = (
+                        1.0 - self._total_tokens_attended / max(self._total_tokens_full, 1)
+                    )
+                    logger.info(
+                        f"[TreeSparse] Stats ({mode_str}, last {self._log_interval} steps): "
+                        f"sparse_layers={self._sparse_layer_count}, "
+                        f"full_layers={self._full_layer_count}, "
+                        f"avg_sparsity={avg_sparsity:.1%}, "
+                        f"avg_tokens_attended={self._total_tokens_attended // max(self._sparse_layer_count, 1)}"
+                        f"/{self._total_tokens_full // max(self._sparse_layer_count, 1)}"
+                    )
+                else:
+                    logger.info(
+                        f"[TreeSparse] Stats ({mode_str}, last {self._log_interval} steps): "
+                        f"NO sparse layers active (all full attention), "
+                        f"full_layers={self._full_layer_count}"
+                    )
+                # Reset counters
+                self._sparse_layer_count = 0
+                self._full_layer_count = 0
+                self._total_tokens_attended = 0
+                self._total_tokens_full = 0
+
+                # Periodically flush JSON files
+                self._flush_json_logs()
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _forward_decode_shared(self, q_reshaped, layer, forward_batch, k, save_kv_cache):
+        """
+        Shared-selection decode: layer 0 computes sparse indices, all layers reuse them.
+
+        This eliminates per-layer selection overhead (~0.9ms × 28 layers = ~25ms saved).
+        Only begin_forward is called once at layer 0; layers 1-27 skip it entirely.
+        """
+        bs = forward_batch.batch_size
+        lid = layer.layer_id
+        t = self.decode_timer
+
+        if layer.layer_id == 0:
+            # === Layer 0: compute and cache sparse indices ===
+            needs_sparse = False
+            for i in range(bs):
+                req_pool_idx = self._decode_req_pool_indices[i]
+                seq_len = self._decode_seq_lens[i]
+                if (
+                    seq_len >= self.min_seq_len_for_sparse
+                    and req_pool_idx in self._registered_reqs
+                    and self.centroid_manager.get_centroids(req_pool_idx, 0) is not None
+                ):
+                    needs_sparse = True
+                    break
+
+            self._shared_needs_sparse = needs_sparse
+
+            if not needs_sparse:
+                self._full_layer_count += 1
+                # Use pre-planned full-attention wrapper (from _init_decode_metadata)
+            else:
+                sparse_kv_indices_list = []
+                for i in range(bs):
+                    req_pool_idx = self._decode_req_pool_indices[i]
+                    seq_len = self._decode_seq_lens[i]
+
+                    t.start(f"L{lid}:sparse_get_centroids")
+                    # Try FP8 centroids first (2-4× faster scoring)
+                    result_fp8 = self.centroid_manager.get_centroids_fp8(req_pool_idx, 0)
+                    if result_fp8 is not None:
+                        centroids_fp8, centroids_scales, chunk_starts, chunk_ends, chunks = result_fp8
+                        centroids = None
+                    else:
+                        result = self.centroid_manager.get_centroids_gpu(req_pool_idx, 0)
+                        if result is not None:
+                            centroids, chunk_starts, chunk_ends, chunks = result
+                            centroids_fp8 = None
+                            centroids_scales = None
+                        else:
+                            centroids = None
+                    t.stop(f"L{lid}:sparse_get_centroids")
+
+                    if (
+                        seq_len < self.min_seq_len_for_sparse
+                        or req_pool_idx not in self._registered_reqs
+                        or centroids is None and centroids_fp8 is None
+                    ):
+                        indices = self.req_to_token[req_pool_idx, :seq_len].to(torch.int32)
+                        sparse_kv_indices_list.append(indices)
+                    else:
+                        q_i = q_reshaped[i : i + 1]
+                        indices, topk_ids = gpu_select_and_build_indices(
+                            query=q_i,
+                            centroids=centroids if centroids is not None else chunk_starts.new_zeros(1, 1, 1),
+                            chunk_starts=chunk_starts,
+                            chunk_ends=chunk_ends,
+                            req_to_token=self.req_to_token,
+                            req_pool_idx=req_pool_idx,
+                            seq_len=seq_len,
+                            top_k=self.top_k_chunks,
+                            num_qo_heads=self.num_qo_heads,
+                            num_kv_heads=self.num_kv_heads,
+                            scaling=layer.scaling,
+                            always_include_first=self.always_include_first,
+                            always_include_recent=self.always_include_recent,
+                            mask_buffer=self._mask_buffer,
+                            timer=t,
+                            timer_prefix=f"L{lid}:",
+                            centroids_fp8=centroids_fp8,
+                            centroids_scales=centroids_scales,
+                        )
+                        sparse_kv_indices_list.append(indices)
+
+                        # Stats tracking
+                        self._sparse_layer_count += 1
+                        self._total_tokens_attended += indices.shape[0]
+                        self._total_tokens_full += seq_len
+
+                        # Logging
+                        if self._decode_step_count % self._log_interval == 0:
+                            selected_ids = topk_ids.tolist()
+                            selected_labels = [
+                                f"chunk_{cid}({chunks[cid].label[:25]})"
+                                for cid in selected_ids
+                                if cid < len(chunks)
+                            ]
+                            selected_tokens = sum(
+                                chunks[cid].token_count
+                                for cid in selected_ids
+                                if cid < len(chunks)
+                            )
+                            logger.info(
+                                f"[TreeSparse] Decode shared layer=0 req={req_pool_idx}: "
+                                f"selected {len(selected_ids)}/{len(chunks)} chunks, "
+                                f"{selected_tokens}+{self.always_include_recent}(recent)+{self.always_include_first}(sink) "
+                                f"of {seq_len} tokens | "
+                                f"selected=[{', '.join(selected_labels[:8])}{'...' if len(selected_labels) > 8 else ''}]"
+                            )
+
+                        # JSON logging
+                        if req_pool_idx in self._req_json_data:
+                            selected_ids = topk_ids.tolist()
+                            selected_tokens = sum(
+                                chunks[cid].token_count
+                                for cid in selected_ids
+                                if cid < len(chunks)
+                            )
+                            step_data = {
+                                "decode_step": self._decode_step_count,
+                                "layer_id": 0,
+                                "mode": "shared",
+                                "seq_len": seq_len,
+                                "selected_chunk_ids": selected_ids,
+                                "selected_chunks": [
+                                    {
+                                        "chunk_id": cid,
+                                        "label": chunks[cid].label,
+                                        "start_idx": chunks[cid].start_idx,
+                                        "end_idx": chunks[cid].end_idx,
+                                        "token_count": chunks[cid].token_count,
+                                    }
+                                    for cid in selected_ids
+                                    if cid < len(chunks)
+                                ],
+                                "total_tokens_attended": selected_tokens + self.always_include_recent + self.always_include_first,
+                                "sparsity": round(1.0 - (selected_tokens + self.always_include_recent + self.always_include_first) / max(seq_len, 1), 4),
+                            }
+                            self._req_json_data[req_pool_idx]["decode_steps"].append(step_data)
+
+                # Cache the sparse metadata and re-plan wrapper ONCE
+                t.start(f"L{lid}:sparse_batch_meta")
+                kv_indptr, kv_indices = build_batch_sparse_metadata(
+                    sparse_kv_indices_list, bs, str(self.device)
+                )
+                self._shared_sparse_indices = (kv_indptr, kv_indices)
+                t.stop(f"L{lid}:sparse_batch_meta")
+
+                t.start(f"L{lid}:begin_forward")
+                self.decode_wrapper.begin_forward(
+                    kv_indptr,
+                    kv_indices,
+                    self.kv_last_page_len[:bs],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    1,
+                    data_type=self.data_type,
+                    q_data_type=self.q_data_type,
+                    non_blocking=True,
+                )
+                t.stop(f"L{lid}:begin_forward")
+        else:
+            # === Layers 1-27: reuse cached indices, no selection, no begin_forward ===
+            if self._shared_needs_sparse:
+                # Stats: count reused layers too
+                self._sparse_layer_count += 1
+
+        # Load KV cache buffer, then execute attention
+        t.start(f"L{lid}:kv_cache_load")
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        t.stop(f"L{lid}:kv_cache_load")
+
+        t.start(f"L{lid}:attention")
+        o = self.forward_metadata.decode_wrapper.forward(
+            q_reshaped,
+            kv_buffer,
+            sm_scale=layer.scaling,
+            logits_soft_cap=layer.logit_cap,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+        )
+        t.stop(f"L{lid}:attention")
+        return o
+
+    def _forward_decode_per_layer(self, q_reshaped, layer, forward_batch, k, save_kv_cache):
+        """Per-layer sparse selection using batched GPU operations."""
+        bs = forward_batch.batch_size
+        lid = layer.layer_id
+        t = self.decode_timer
 
         # Check if any request needs sparse attention for this layer
         needs_sparse = False
@@ -820,119 +1104,53 @@ class TreeSparseAttnBackend(AttentionBackend):
             # Full attention — use pre-planned wrapper from _init_decode_metadata
             if layer.layer_id == 0:
                 self._full_layer_count += 1
+            t.start(f"L{lid}:kv_cache_load")
+            kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            t.stop(f"L{lid}:kv_cache_load")
+            t.start(f"L{lid}:attention")
             o = self.forward_metadata.decode_wrapper.forward(
                 q_reshaped,
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                kv_buffer,
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            t.stop(f"L{lid}:attention")
         else:
-            # GPU kernel-based sparse selection per layer
-            sparse_kv_indices_list = []
+            # Unified ragged sparse selection (DeepSeek NSA style)
+            # Single code path for all batch sizes - no padding, no complexity!
+            from sglang.srt.layers.attention.tree_sparse.kernels import unified_ragged_sparse_select
 
-            for i in range(bs):
-                req_pool_idx = self._decode_req_pool_indices[i]
-                seq_len = self._decode_seq_lens[i]
-
-                result = self.centroid_manager.get_centroids_gpu(
-                    req_pool_idx, layer.layer_id
-                )
-                if (
-                    seq_len < self.min_seq_len_for_sparse
-                    or req_pool_idx not in self._registered_reqs
-                    or result is None
-                ):
-                    # Full attention for this request
-                    indices = self.req_to_token[req_pool_idx, :seq_len].to(
-                        torch.int32
-                    )
-                    sparse_kv_indices_list.append(indices)
-                else:
-                    centroids, chunk_starts, chunk_ends, chunks = result
-
-                    # GPU-native selection: scoring + topk + Triton mask + nonzero
-                    q_i = q_reshaped[i : i + 1]
-                    indices, topk_ids = gpu_select_and_build_indices(
-                        query=q_i,
-                        centroids=centroids,
-                        chunk_starts=chunk_starts,
-                        chunk_ends=chunk_ends,
-                        req_to_token=self.req_to_token,
-                        req_pool_idx=req_pool_idx,
-                        seq_len=seq_len,
-                        top_k=self.top_k_chunks,
-                        num_qo_heads=self.num_qo_heads,
-                        num_kv_heads=self.num_kv_heads,
-                        scaling=layer.scaling,
-                        always_include_first=self.always_include_first,
-                        always_include_recent=self.always_include_recent,
-                        mask_buffer=self._mask_buffer,
-                    )
-                    sparse_kv_indices_list.append(indices)
-
-                    # Stats tracking (no .item() — use tensor len)
-                    self._sparse_layer_count += 1
-                    self._total_tokens_attended += indices.shape[0]
-                    self._total_tokens_full += seq_len
-
-                    # Logging (layer 0 only, every N steps)
-                    if layer.layer_id == 0 and self._decode_step_count % self._log_interval == 0:
-                        # Only call .tolist() when actually logging (rare)
-                        selected_ids = topk_ids.tolist()
-                        selected_labels = [
-                            f"chunk_{cid}({chunks[cid].label[:25]})"
-                            for cid in selected_ids
-                            if cid < len(chunks)
-                        ]
-                        selected_tokens = sum(
-                            chunks[cid].token_count
-                            for cid in selected_ids
-                            if cid < len(chunks)
-                        )
-                        logger.info(
-                            f"[TreeSparse] Decode layer={layer.layer_id} req={req_pool_idx}: "
-                            f"selected {len(selected_ids)}/{len(chunks)} chunks, "
-                            f"{selected_tokens}+{self.always_include_recent}(recent)+{self.always_include_first}(sink) "
-                            f"of {seq_len} tokens | "
-                            f"selected=[{', '.join(selected_labels[:8])}{'...' if len(selected_labels) > 8 else ''}]"
-                        )
-
-                    # JSON logging (layer 0 only, every step)
-                    if layer.layer_id == 0 and req_pool_idx in self._req_json_data:
-                        selected_ids = topk_ids.tolist()
-                        selected_tokens = sum(
-                            chunks[cid].token_count
-                            for cid in selected_ids
-                            if cid < len(chunks)
-                        )
-                        step_data = {
-                            "decode_step": self._decode_step_count,
-                            "layer_id": 0,
-                            "seq_len": seq_len,
-                            "selected_chunk_ids": selected_ids,
-                            "selected_chunks": [
-                                {
-                                    "chunk_id": cid,
-                                    "label": chunks[cid].label,
-                                    "start_idx": chunks[cid].start_idx,
-                                    "end_idx": chunks[cid].end_idx,
-                                    "token_count": chunks[cid].token_count,
-                                }
-                                for cid in selected_ids
-                                if cid < len(chunks)
-                            ],
-                            "total_tokens_attended": selected_tokens + self.always_include_recent + self.always_include_first,
-                            "sparsity": round(1.0 - (selected_tokens + self.always_include_recent + self.always_include_first) / max(seq_len, 1), 4),
-                        }
-                        self._req_json_data[req_pool_idx]["decode_steps"].append(step_data)
-
-            # Re-plan wrapper with sparse indices for this layer
-            kv_indptr, kv_indices = build_batch_sparse_metadata(
-                sparse_kv_indices_list, bs, str(self.device)
+            kv_indptr, kv_indices, topk_ids_list = unified_ragged_sparse_select(
+                queries=q_reshaped,
+                centroid_manager=self.centroid_manager,
+                req_pool_indices=self._decode_req_pool_indices,
+                seq_lens=self._decode_seq_lens,
+                layer_id=layer.layer_id,
+                req_to_token=self.req_to_token,
+                top_k=self.top_k_chunks,
+                num_qo_heads=self.num_qo_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=layer.head_dim,
+                scaling=layer.scaling,
+                always_include_first=self.always_include_first,
+                always_include_recent=self.always_include_recent,
+                min_seq_len_for_sparse=self.min_seq_len_for_sparse,
+                registered_reqs=self._registered_reqs,
+                timer=t,
+                timer_prefix=f"L{lid}:",
             )
 
+            # Stats tracking
+            for i in range(bs):
+                if topk_ids_list[i] is not None:
+                    self._sparse_layer_count += 1
+                    tokens_attended = kv_indptr[i + 1].item() - kv_indptr[i].item()
+                    self._total_tokens_attended += tokens_attended
+                    self._total_tokens_full += self._decode_seq_lens[i]
+
+            t.start(f"L{lid}:begin_forward")
             self.decode_wrapper.begin_forward(
                 kv_indptr,
                 kv_indices,
@@ -945,60 +1163,24 @@ class TreeSparseAttnBackend(AttentionBackend):
                 q_data_type=self.q_data_type,
                 non_blocking=True,
             )
+            t.stop(f"L{lid}:begin_forward")
 
+            t.start(f"L{lid}:kv_cache_load")
+            kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            t.stop(f"L{lid}:kv_cache_load")
+
+            t.start(f"L{lid}:attention")
             o = self.decode_wrapper.forward(
                 q_reshaped,
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                kv_buffer,
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            t.stop(f"L{lid}:attention")
 
-        # Incrementally update centroids with the new key (per-layer)
-        if save_kv_cache and k is not None:
-            for i in range(bs):
-                req_pool_idx = self._decode_req_pool_indices[i]
-                if req_pool_idx in self._registered_reqs:
-                    self.centroid_manager.update_centroid_incremental(
-                        req_pool_idx=req_pool_idx,
-                        layer_id=layer.layer_id,
-                        new_key=k[i : i + 1],
-                        chunk_id=-1,
-                    )
-
-        # Periodic stats logging (only on last layer to count once per decode step)
-        if layer.layer_id == self.num_layers - 1:
-            self._decode_step_count += 1
-            if self._decode_step_count % self._log_interval == 0:
-                if self._sparse_layer_count > 0:
-                    avg_sparsity = (
-                        1.0 - self._total_tokens_attended / max(self._total_tokens_full, 1)
-                    )
-                    logger.info(
-                        f"[TreeSparse] Stats (last {self._log_interval} steps): "
-                        f"sparse_layers={self._sparse_layer_count}, "
-                        f"full_layers={self._full_layer_count}, "
-                        f"avg_sparsity={avg_sparsity:.1%}, "
-                        f"avg_tokens_attended={self._total_tokens_attended // max(self._sparse_layer_count, 1)}"
-                        f"/{self._total_tokens_full // max(self._sparse_layer_count, 1)}"
-                    )
-                else:
-                    logger.info(
-                        f"[TreeSparse] Stats (last {self._log_interval} steps): "
-                        f"NO sparse layers active (all full attention), "
-                        f"full_layers={self._full_layer_count}"
-                    )
-                # Reset counters
-                self._sparse_layer_count = 0
-                self._full_layer_count = 0
-                self._total_tokens_attended = 0
-                self._total_tokens_full = 0
-
-                # Periodically flush JSON files
-                self._flush_json_logs()
-
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        return o
 
     def _flush_json_logs(self):
         """Write accumulated decode_steps to JSON files."""

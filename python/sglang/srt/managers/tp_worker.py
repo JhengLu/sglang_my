@@ -505,9 +505,12 @@ class TpModelWorker(BaseTpWorker):
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                _t = getattr(forward_batch, "decode_timer", None)
+                if _t: _t.start("sched:sampling")
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                if _t: _t.stop("sched:sampling")
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens

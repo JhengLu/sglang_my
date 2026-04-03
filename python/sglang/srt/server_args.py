@@ -589,6 +589,7 @@ class ServerArgs:
     tree_sparse_max_chunk_size: int = 256
     tree_sparse_recent_tokens: int = 128
     tree_sparse_full_prefill: bool = False
+    tree_sparse_shared_selection: bool = False  # Use layer-0 selection for all layers
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -5214,6 +5215,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tree_sparse_recent_tokens,
             help="Number of recent tokens always included in sparse attention.",
+        )
+        parser.add_argument(
+            "--tree-sparse-full-prefill",
+            action="store_true",
+            help="Use full attention during prefill (no sparse selection).",
+        )
+        parser.add_argument(
+            "--tree-sparse-shared-selection",
+            action="store_true",
+            help="Use layer-0 chunk selection for all layers (faster, no per-layer selection).",
         )
 
         # Double Sparsity

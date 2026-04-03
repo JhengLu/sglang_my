@@ -421,6 +421,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        # For Quest sparse attention on MHA models (via SparseCoordinator)
+        self.sparse_coordinator = None
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -617,23 +619,43 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
         if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+            from sglang.srt.configs.model_config import is_deepseek_nsa
 
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_cfg.top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            )
+            is_nsa = is_deepseek_nsa(self.model_config.hf_config)
+            if is_nsa:
+                from sglang.srt.managers.hisparse_coordinator import (
+                    HiSparseCoordinator,
+                )
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_cfg.top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=(
+                        self.attention_tp_group.cpu_group
+                        if self.server_args.enable_dp_attention
+                        else self.tp_group.cpu_group
+                    ),
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                )
+            else:
+                # MHA models: use SparseCoordinator for Quest sparse attention
+                from sglang.srt.mem_cache.sparsity import (
+                    create_sparse_coordinator,
+                )
+
+                self.sparse_coordinator = create_sparse_coordinator(
+                    device=self.device,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    server_args=self.server_args,
+                )
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -2506,6 +2528,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Decode step timer (tree-sparse profiling)
+        _timer = getattr(self.attn_backend, "decode_timer", None)
+        if _timer:
+            _timer.start_total()
+            forward_batch.decode_timer = _timer
+
         if not skip_attn_backend_init:
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
@@ -2516,12 +2544,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
+        result = self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
             **kwargs,
         )
+
+        if _timer:
+            _timer.stop_total()
+
+        return result
 
     def forward_extend(
         self,
@@ -2713,6 +2746,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+        forward_batch.sparse_coordinator = self.sparse_coordinator
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

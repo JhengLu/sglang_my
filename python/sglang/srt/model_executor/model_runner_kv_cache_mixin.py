@@ -728,22 +728,41 @@ class ModelRunnerKVCacheMixin:
                     )
                 else:
                     if self.enable_hisparse:
-                        from sglang.srt.mem_cache.sparsity import (
-                            parse_hisparse_config,
+                        is_nsa = is_deepseek_nsa(
+                            self.model_config.hf_config
                         )
-
-                        hisparse_cfg = parse_hisparse_config(self.server_args)
-                        self.token_to_kv_pool_allocator = (
-                            HiSparseTokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                page_size=self.page_size,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
-                                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                        if is_nsa:
+                            from sglang.srt.mem_cache.sparsity import (
+                                parse_hisparse_config,
                             )
-                        )
+
+                            hisparse_cfg = parse_hisparse_config(
+                                self.server_args
+                            )
+                            self.token_to_kv_pool_allocator = (
+                                HiSparseTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                )
+                            )
+                        else:
+                            # MHA models: use regular paged allocator
+                            # (Quest sparse attention without host/device tiering)
+                            self.token_to_kv_pool_allocator = (
+                                PagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
+                            )
                     elif self.page_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,

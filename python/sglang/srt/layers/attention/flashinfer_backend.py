@@ -21,6 +21,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.tree_sparse.decode_timer import DecodeStepTimer
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -300,6 +301,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+        # Decode step timer for profiling (enabled via TREE_SPARSE_TIMING=1)
+        self.decode_timer = DecodeStepTimer(
+            num_layers=model_runner.model_config.num_hidden_layers
+        )
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -876,6 +882,9 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        t = self.decode_timer
+        lid = layer.layer_id
+
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -888,20 +897,29 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
+                t.start(f"L{lid}:kv_cache_save")
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+                t.stop(f"L{lid}:kv_cache_save")
+
+        # Load KV buffer
+        t.start(f"L{lid}:kv_cache_load")
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        t.stop(f"L{lid}:kv_cache_load")
 
         # Call the wrapped function
+        t.start(f"L{lid}:attention")
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            kv_buffer,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
+        t.stop(f"L{lid}:attention")
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
