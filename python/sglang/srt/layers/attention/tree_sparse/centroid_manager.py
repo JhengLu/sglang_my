@@ -222,6 +222,15 @@ class CentroidManager:
     def has_request(self, req_pool_idx: int) -> bool:
         return req_pool_idx in self._entries
 
+    def get_chunk_tensors(
+        self, req_pool_idx: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return cached chunk boundary tensors for a request."""
+        entry = self._entries.get(req_pool_idx)
+        if entry is None:
+            return None
+        return entry.chunk_starts, entry.chunk_ends
+
     def update_centroids_for_layer(
         self,
         req_pool_idx: int,

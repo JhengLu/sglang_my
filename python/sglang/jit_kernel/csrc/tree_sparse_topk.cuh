@@ -31,25 +31,22 @@ namespace {
 // Block: (kBlockSize,) — multiple warps cooperate on dot products
 //
 // Shared memory layout:
-//   fp8_e4m3_t query_fp8[kNumKvHeads * kHeadDim] — cached query quantized to FP8
-//   float topk_scores[kTopK]                      — running top-k scores
-//   int32_t topk_indices[kTopK]                   — running top-k chunk IDs
-//   float head_scores[kNumWarps]                  — per-warp head dot products
+//   fp8_e4m3_t query_fp8[kNumKvHeads * kHeadDim]     — cached query quantized to FP8
+//   float warp_topk_scores[kNumWarps * kTopK]        — per-warp running top-k scores
+//   int32_t warp_topk_indices[kNumWarps * kTopK]     — per-warp running top-k chunk IDs
 //
-template <typename QueryT, typename CentroidT, uint32_t kNumKvHeads, uint32_t kHeadDim, uint32_t kTopK, uint32_t kBlockSize>
-__global__ void fused_score_topk_count_kernel(
+template <typename QueryT, typename CentroidT, uint32_t kNumKvHeads, uint32_t kHeadDim, uint32_t kTopK, uint32_t kBlockSize, uint32_t kChunksPerTile>
+__global__ void score_partial_topk_kernel(
     const QueryT* __restrict__ queries,          // [bs, kNumKvHeads, kHeadDim] (bf16/fp16/fp32)
     const CentroidT* __restrict__ centroids,     // [total_chunks, kNumKvHeads, kHeadDim] (fp8/bf16/fp16/fp32)
     const int32_t* __restrict__ chunk_offsets,   // [bs + 1]
-    const int32_t* __restrict__ chunk_starts,    // [total_sparse_chunks]
-    const int32_t* __restrict__ chunk_ends,      // [total_sparse_chunks]
-    const int32_t* __restrict__ seq_lens,        // [bs]
     const int32_t* __restrict__ sparse_req_mask, // [bs] (1=sparse, 0=full)
+    const int32_t* __restrict__ schedule_offsets,// [num_schedule_blocks + 1]
+    const int32_t* __restrict__ schedule_req_indices, // [total_tiles]
+    const int32_t* __restrict__ schedule_tile_indices, // [total_tiles]
     float scaling,
-    int32_t always_include_first,
-    int32_t always_include_recent,
-    int32_t* __restrict__ token_counts,          // [bs] output
-    int32_t* __restrict__ topk_out,              // [bs, kTopK] output
+    float* __restrict__ partial_topk_scores,     // [bs, tiles, kTopK]
+    int32_t* __restrict__ partial_topk_indices,  // [bs, tiles, kTopK]
     float* __restrict__ scores_debug             // [total_chunks] optional debug output (can be nullptr)
 ) {
   constexpr uint32_t kWarpSize = 32;
@@ -57,7 +54,6 @@ __global__ void fused_score_topk_count_kernel(
   // Elements per thread for dot product (each thread handles kVecLen floats)
   constexpr uint32_t kVecLen = kHeadDim / kWarpSize;  // e.g., 128/32 = 4
 
-  const uint32_t bid = blockIdx.x;
   const uint32_t tid = threadIdx.x;
   const uint32_t warp_id = tid / kWarpSize;
   const uint32_t lane_id = tid % kWarpSize;
@@ -65,168 +61,240 @@ __global__ void fused_score_topk_count_kernel(
   // Dynamic shared memory - store queries as FP8 for bandwidth efficiency
   extern __shared__ char smem_raw[];
   fp8_e4m3_t* query_fp8_smem = reinterpret_cast<fp8_e4m3_t*>(smem_raw);
-  float* topk_scores_smem = reinterpret_cast<float*>(query_fp8_smem + kNumKvHeads * kHeadDim);
-  int32_t* topk_indices_smem = reinterpret_cast<int32_t*>(topk_scores_smem + kTopK);
-  float* head_scores_smem = reinterpret_cast<float*>(topk_indices_smem + kTopK);
+  float* warp_topk_scores_smem =
+      reinterpret_cast<float*>(query_fp8_smem + kNumKvHeads * kHeadDim);
+  int32_t* warp_topk_indices_smem =
+      reinterpret_cast<int32_t*>(warp_topk_scores_smem + kNumWarps * kTopK);
+
+  const int32_t task_start = schedule_offsets[blockIdx.x];
+  const int32_t task_end = schedule_offsets[blockIdx.x + 1];
+  for (int32_t task_idx = task_start; task_idx < task_end; ++task_idx) {
+    const int32_t bid = schedule_req_indices[task_idx];
+    const int32_t tile_idx = schedule_tile_indices[task_idx];
+    const int32_t is_sparse = sparse_req_mask[bid];
+    if (!is_sparse) {
+      continue;
+    }
+
+    const QueryT* query_ptr =
+        queries + static_cast<int64_t>(bid) * kNumKvHeads * kHeadDim;
+    for (uint32_t i = tid; i < kNumKvHeads * kHeadDim; i += kBlockSize) {
+      query_fp8_smem[i] =
+          static_cast<fp8_e4m3_t>(static_cast<float>(query_ptr[i]));
+    }
+    if (lane_id < kTopK) {
+      const uint32_t local_offset = warp_id * kTopK + lane_id;
+      warp_topk_scores_smem[local_offset] = -FLT_MAX;
+      warp_topk_indices_smem[local_offset] = -1;
+    }
+    __syncthreads();
+
+    const int32_t chunk_start_idx = chunk_offsets[bid];
+    const int32_t chunk_end_idx = chunk_offsets[bid + 1];
+    const int32_t num_chunks = chunk_end_idx - chunk_start_idx;
+    const int32_t tile_chunk_start =
+        tile_idx * static_cast<int32_t>(kChunksPerTile);
+    const int32_t tile_chunk_end =
+        min(tile_chunk_start + static_cast<int32_t>(kChunksPerTile), num_chunks);
+
+    for (int32_t c = tile_chunk_start + static_cast<int32_t>(warp_id);
+         c < tile_chunk_end; c += kNumWarps) {
+      const int32_t global_cid = chunk_start_idx + c;
+      const CentroidT* cent_base =
+          centroids + static_cast<int64_t>(global_cid) * kNumKvHeads * kHeadDim;
+
+      float score_sum = 0.0f;
+      for (uint32_t h = 0; h < kNumKvHeads; ++h) {
+        float partial = 0.0f;
+        const fp8_e4m3_t* q_head = query_fp8_smem + h * kHeadDim;
+        const CentroidT* c_head = cent_base + h * kHeadDim;
+#pragma unroll
+        for (uint32_t v = 0; v < kVecLen; ++v) {
+          const uint32_t idx = lane_id * kVecLen + v;
+          partial += static_cast<float>(q_head[idx]) *
+                     static_cast<float>(c_head[idx]);
+        }
+        partial = device::warp::reduce_sum(partial);
+        if (lane_id == 0) {
+          score_sum += partial;
+        }
+      }
+
+      if (lane_id == 0) {
+        float score = (score_sum / static_cast<float>(kNumKvHeads)) * scaling;
+        float* local_scores = warp_topk_scores_smem + warp_id * kTopK;
+        int32_t* local_indices = warp_topk_indices_smem + warp_id * kTopK;
+        if (scores_debug != nullptr) {
+          scores_debug[global_cid] = score;
+        }
+        if (score > local_scores[kTopK - 1]) {
+          uint32_t pos = kTopK - 1;
+          while (pos > 0 && score > local_scores[pos - 1]) {
+            local_scores[pos] = local_scores[pos - 1];
+            local_indices[pos] = local_indices[pos - 1];
+            --pos;
+          }
+          local_scores[pos] = score;
+          local_indices[pos] = c;
+        }
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      float topk_scores_smem[kTopK];
+      int32_t topk_indices_smem[kTopK];
+      for (uint32_t i = 0; i < kTopK; ++i) {
+        topk_scores_smem[i] = -FLT_MAX;
+        topk_indices_smem[i] = -1;
+      }
+
+      for (uint32_t w = 0; w < kNumWarps; ++w) {
+        const float* local_scores = warp_topk_scores_smem + w * kTopK;
+        const int32_t* local_indices = warp_topk_indices_smem + w * kTopK;
+        for (uint32_t i = 0; i < kTopK; ++i) {
+          const float score = local_scores[i];
+          const int32_t local_cid = local_indices[i];
+          if (local_cid < 0 || score <= topk_scores_smem[kTopK - 1]) continue;
+
+          uint32_t pos = kTopK - 1;
+          while (pos > 0 && score > topk_scores_smem[pos - 1]) {
+            topk_scores_smem[pos] = topk_scores_smem[pos - 1];
+            topk_indices_smem[pos] = topk_indices_smem[pos - 1];
+            --pos;
+          }
+          topk_scores_smem[pos] = score;
+          topk_indices_smem[pos] = local_cid;
+        }
+      }
+
+      const int32_t actual_k =
+          (tile_chunk_end - tile_chunk_start < static_cast<int32_t>(kTopK))
+              ? (tile_chunk_end - tile_chunk_start)
+              : static_cast<int32_t>(kTopK);
+      for (int32_t i = 0; i < actual_k - 1; ++i) {
+        for (int32_t j = 0; j < actual_k - 1 - i; ++j) {
+          if (topk_indices_smem[j] > topk_indices_smem[j + 1]) {
+            int32_t tmp_idx = topk_indices_smem[j];
+            topk_indices_smem[j] = topk_indices_smem[j + 1];
+            topk_indices_smem[j + 1] = tmp_idx;
+            float tmp_score = topk_scores_smem[j];
+            topk_scores_smem[j] = topk_scores_smem[j + 1];
+            topk_scores_smem[j + 1] = tmp_score;
+          }
+        }
+      }
+
+      const int64_t tile_base = static_cast<int64_t>(task_idx) * kTopK;
+      for (uint32_t i = 0; i < kTopK; ++i) {
+        partial_topk_scores[tile_base + i] = topk_scores_smem[i];
+        partial_topk_indices[tile_base + i] = topk_indices_smem[i];
+      }
+    }
+    __syncthreads();
+  }
+}
+
+
+template <uint32_t kTopK, uint32_t kBlockSize>
+__global__ void merge_partial_topk_kernel(
+    const float* __restrict__ partial_topk_scores,    // [bs, tiles, kTopK]
+    const int32_t* __restrict__ partial_topk_indices, // [bs, tiles, kTopK]
+    const int32_t* __restrict__ chunk_offsets,        // [bs + 1]
+    const int32_t* __restrict__ chunk_starts,         // [total_sparse_chunks]
+    const int32_t* __restrict__ chunk_ends,           // [total_sparse_chunks]
+    const int32_t* __restrict__ tile_offsets,         // [bs + 1]
+    const int32_t* __restrict__ seq_lens,             // [bs]
+    const int32_t* __restrict__ sparse_req_mask,      // [bs]
+    float scaling,
+    int32_t always_include_first,
+    int32_t always_include_recent,
+    int32_t* __restrict__ token_counts,               // [bs]
+    int32_t* __restrict__ topk_out                    // [bs, kTopK]
+) {
+  const uint32_t bid = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  if (tid != 0) return;
 
   const int32_t seq_len = seq_lens[bid];
   const int32_t is_sparse = sparse_req_mask[bid];
-
-  // ---- Handle full-attention requests (no scoring needed) ----
   if (!is_sparse) {
-    if (tid == 0) {
-      token_counts[bid] = seq_len;
-      // Mark topk as invalid for full requests
-      for (uint32_t i = 0; i < kTopK; ++i) {
-        topk_out[bid * kTopK + i] = -1;
-      }
+    token_counts[bid] = seq_len;
+    for (uint32_t i = 0; i < kTopK; ++i) {
+      topk_out[bid * kTopK + i] = -1;
     }
     return;
   }
 
-  // ---- Phase 1: Load query into shared memory and quantize to FP8 ----
-  const QueryT* query_ptr = queries + static_cast<int64_t>(bid) * kNumKvHeads * kHeadDim;
-  // Cooperative load: each thread loads multiple elements and quantizes bf16/fp16 → fp8
-  for (uint32_t i = tid; i < kNumKvHeads * kHeadDim; i += kBlockSize) {
-    // Convert: QueryT → float → fp8 (CUDA handles fp8 conversion automatically)
-    query_fp8_smem[i] = static_cast<fp8_e4m3_t>(static_cast<float>(query_ptr[i]));
+  float topk_scores[kTopK];
+  int32_t topk_indices[kTopK];
+  for (uint32_t i = 0; i < kTopK; ++i) {
+    topk_scores[i] = -FLT_MAX;
+    topk_indices[i] = -1;
   }
 
-  // Initialize topk
-  if (tid < kTopK) {
-    topk_scores_smem[tid] = -FLT_MAX;
-    topk_indices_smem[tid] = -1;
-  }
-  __syncthreads();
-
-  // ---- Phase 2: Score all chunks ----
   const int32_t chunk_start_idx = chunk_offsets[bid];
-  const int32_t chunk_end_idx = chunk_offsets[bid + 1];
-  const int32_t num_chunks = chunk_end_idx - chunk_start_idx;
+  const int32_t num_chunks = chunk_offsets[bid + 1] - chunk_start_idx;
+  const int32_t req_tile_start = tile_offsets[bid];
+  const int32_t req_tile_end = tile_offsets[bid + 1];
 
-  for (int32_t c = 0; c < num_chunks; ++c) {
-    const int32_t global_cid = chunk_start_idx + c;
-    const CentroidT* cent_base = centroids + static_cast<int64_t>(global_cid) * kNumKvHeads * kHeadDim;
-
-    // Each warp handles one or more heads (round-robin if kNumWarps < kNumKvHeads)
-    float warp_head_sum = 0.0f;
-    for (uint32_t h = warp_id; h < kNumKvHeads; h += kNumWarps) {
-      // FP8 × FP8 dot product: query_fp8[h] . centroid_fp8[global_cid][h]
-      float partial = 0.0f;
-      const fp8_e4m3_t* q_head = query_fp8_smem + h * kHeadDim;
-      const CentroidT* c_head = cent_base + h * kHeadDim;
-
-      // Vectorized: each lane handles kVecLen consecutive elements
-      // Load fp8, convert to fp32, accumulate (minimal precision loss, huge bandwidth win!)
-#pragma unroll
-      for (uint32_t v = 0; v < kVecLen; ++v) {
-        const uint32_t idx = lane_id * kVecLen + v;
-        // Convert fp8 → float for computation (hardware accelerated on B200)
-        partial += static_cast<float>(q_head[idx]) * static_cast<float>(c_head[idx]);
-      }
-
-      // Warp-level reduction
-      partial = device::warp::reduce_sum(partial);
-      warp_head_sum += partial;
-    }
-
-    // Warp 0, lane 0 collects head scores from all warps and computes final score
-    if (lane_id == 0 && warp_id < kNumWarps) {
-      head_scores_smem[warp_id] = warp_head_sum;
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-      float total_score = 0.0f;
-      // Sum contributions from all warps
-      // (Each warp may have accumulated multiple heads if kNumWarps < kNumKvHeads)
-      for (uint32_t w = 0; w < kNumWarps; ++w) {
-        total_score += head_scores_smem[w];
-      }
-      // Average across heads and apply scaling
-      float score = (total_score / static_cast<float>(kNumKvHeads)) * scaling;
-
-      // Optional debug output
-      if (scores_debug != nullptr) {
-        scores_debug[global_cid] = score;
-      }
-
-      // Insertion sort into topk (k is small, e.g. 8)
-      if (score > topk_scores_smem[kTopK - 1]) {
-        // Find insertion position
-        uint32_t pos = kTopK - 1;
-        while (pos > 0 && score > topk_scores_smem[pos - 1]) {
-          topk_scores_smem[pos] = topk_scores_smem[pos - 1];
-          topk_indices_smem[pos] = topk_indices_smem[pos - 1];
-          --pos;
-        }
-        topk_scores_smem[pos] = score;
-        topk_indices_smem[pos] = c;  // Local chunk index (relative to this request)
-      }
-    }
-    __syncthreads();
-  }
-
-  // ---- Phase 3: Sort topk indices (for determinism) and count tokens ----
-  if (tid == 0) {
-    // Clamp k to actual number of chunks
-    const int32_t actual_k = (num_chunks < static_cast<int32_t>(kTopK))
-                                 ? num_chunks
-                                 : static_cast<int32_t>(kTopK);
-
-    // Bubble sort topk_indices by index value (ascending) for deterministic output
-    for (int32_t i = 0; i < actual_k - 1; ++i) {
-      for (int32_t j = 0; j < actual_k - 1 - i; ++j) {
-        if (topk_indices_smem[j] > topk_indices_smem[j + 1]) {
-          // Swap indices
-          int32_t tmp_idx = topk_indices_smem[j];
-          topk_indices_smem[j] = topk_indices_smem[j + 1];
-          topk_indices_smem[j + 1] = tmp_idx;
-          // Swap scores (keep aligned)
-          float tmp_score = topk_scores_smem[j];
-          topk_scores_smem[j] = topk_scores_smem[j + 1];
-          topk_scores_smem[j + 1] = tmp_score;
-        }
-      }
-    }
-
-    // Write sorted topk indices to global memory
+  for (int32_t task_idx = req_tile_start; task_idx < req_tile_end; ++task_idx) {
+    const int64_t tile_base = static_cast<int64_t>(task_idx) * kTopK;
     for (uint32_t i = 0; i < kTopK; ++i) {
-      topk_out[bid * kTopK + i] = topk_indices_smem[i];
+      const float score = partial_topk_scores[tile_base + i];
+      const int32_t local_cid = partial_topk_indices[tile_base + i];
+      if (local_cid < 0 || score <= topk_scores[kTopK - 1]) continue;
+
+      uint32_t pos = kTopK - 1;
+      while (pos > 0 && score > topk_scores[pos - 1]) {
+        topk_scores[pos] = topk_scores[pos - 1];
+        topk_indices[pos] = topk_indices[pos - 1];
+        --pos;
+      }
+      topk_scores[pos] = score;
+      topk_indices[pos] = local_cid;
     }
+  }
 
-    // ---- Count output tokens ----
-    const int32_t first_count = (always_include_first < seq_len)
-                                    ? always_include_first : seq_len;
-    const int32_t recent_start = (seq_len > always_include_recent)
-                                     ? (seq_len - always_include_recent) : 0;
+  const int32_t actual_k = (num_chunks < static_cast<int32_t>(kTopK))
+                               ? num_chunks
+                               : static_cast<int32_t>(kTopK);
 
-    int32_t count = first_count;  // Sink tokens
-
-    // Selected chunks (clamped to avoid overlap with sink/recent)
-    for (int32_t i = 0; i < actual_k; ++i) {
-      const int32_t local_cid = topk_indices_smem[i];
-      if (local_cid < 0) continue;
-      const int32_t global_cid = chunk_start_idx + local_cid;
-      int32_t cs = chunk_starts[global_cid];
-      int32_t ce = chunk_ends[global_cid] + 1;  // Convert inclusive to exclusive
-
-      // Clamp to [first_count, recent_start)
-      if (cs < first_count) cs = first_count;
-      if (ce > recent_start) ce = recent_start;
-      if (ce > cs) {
-        count += (ce - cs);
+  for (int32_t i = 0; i < actual_k - 1; ++i) {
+    for (int32_t j = 0; j < actual_k - 1 - i; ++j) {
+      if (topk_indices[j] > topk_indices[j + 1]) {
+        int32_t tmp_idx = topk_indices[j];
+        topk_indices[j] = topk_indices[j + 1];
+        topk_indices[j + 1] = tmp_idx;
+        float tmp_score = topk_scores[j];
+        topk_scores[j] = topk_scores[j + 1];
+        topk_scores[j + 1] = tmp_score;
       }
     }
-
-    // Recent tokens
-    const int32_t recent_count = seq_len - recent_start;
-    if (recent_count > 0) {
-      count += recent_count;
-    }
-
-    token_counts[bid] = count;
   }
+
+  for (uint32_t i = 0; i < kTopK; ++i) {
+    topk_out[bid * kTopK + i] = topk_indices[i];
+  }
+
+  const int32_t first_count = (always_include_first < seq_len)
+                                  ? always_include_first : seq_len;
+  const int32_t recent_start = (seq_len > always_include_recent)
+                                   ? (seq_len - always_include_recent) : 0;
+  int32_t count = first_count;
+  for (int32_t i = 0; i < actual_k; ++i) {
+    const int32_t local_cid = topk_indices[i];
+    if (local_cid < 0) continue;
+    const int32_t global_cid = chunk_start_idx + local_cid;
+    int32_t cs = chunk_starts[global_cid];
+    int32_t ce = chunk_ends[global_cid] + 1;
+    if (cs < first_count) cs = first_count;
+    if (ce > recent_start) ce = recent_start;
+    if (ce > cs) count += (ce - cs);
+  }
+  const int32_t recent_count = seq_len - recent_start;
+  if (recent_count > 0) count += recent_count;
+  token_counts[bid] = count;
 }
 
 
@@ -356,9 +424,15 @@ void fused_score_topk_count(
     tvm::ffi::TensorView chunk_offsets,      // [bs + 1] int32
     tvm::ffi::TensorView chunk_starts,       // [total_sparse_chunks] int32
     tvm::ffi::TensorView chunk_ends,         // [total_sparse_chunks] int32
-    tvm::ffi::TensorView seq_lens,           // [bs] int32
     tvm::ffi::TensorView sparse_req_mask,    // [bs] int32
+    tvm::ffi::TensorView tile_offsets,       // [bs + 1] int32
+    tvm::ffi::TensorView schedule_offsets,   // [num_schedule_blocks + 1] int32
+    tvm::ffi::TensorView schedule_req_indices,// [total_tiles] int32
+    tvm::ffi::TensorView schedule_tile_indices,// [total_tiles] int32
     float scaling,
+    tvm::ffi::TensorView partial_topk_scores,// [total_tiles, kTopK] float32
+    tvm::ffi::TensorView partial_topk_indices,// [total_tiles, kTopK] int32
+    tvm::ffi::TensorView seq_lens,           // [bs] int32
     int32_t always_include_first,
     int32_t always_include_recent,
     tvm::ffi::TensorView token_counts,       // [bs] int32 output
@@ -366,6 +440,7 @@ void fused_score_topk_count(
     tvm::ffi::TensorView scores_debug        // [total_chunks] float32 output (optional)
 ) {
   using namespace host;
+  constexpr uint32_t kChunksPerTile = 32;
 
   SymbolicSize BS{"batch_size"};
   SymbolicSize TC{"total_chunks"};
@@ -402,20 +477,49 @@ void fused_score_topk_count(
       .with_device<kDLCUDA>(device_)
       .verify(topk_out);
 
+  SymbolicSize BS1Tile{"bs_plus_1_tile"};
+  TensorMatcher({BS1Tile})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(tile_offsets);
+
+  SymbolicSize ScheduleBlocks1{"schedule_blocks_plus_1"};
+  TensorMatcher({ScheduleBlocks1})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(schedule_offsets);
+
+  SymbolicSize Tasks{"total_tiles"};
+  TensorMatcher({Tasks})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(schedule_req_indices)
+      .verify(schedule_tile_indices);
+
+  TensorMatcher({Tasks, kTopK})
+      .with_dtype<float>()
+      .with_device<kDLCUDA>(device_)
+      .verify(partial_topk_scores);
+  TensorMatcher({Tasks, kTopK})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(partial_topk_indices);
+
   const auto bs = static_cast<uint32_t>(BS.unwrap());
+  const auto num_schedule_blocks =
+      static_cast<uint32_t>(ScheduleBlocks1.unwrap() - 1);
   const auto device = device_.unwrap();
   const auto query_dtype = query_dtype_.unwrap();
   const auto centroid_dtype = centroid_dtype_.unwrap();
 
   if (bs == 0) return;
 
-  // Shared memory: query_fp8 + topk_scores + topk_indices + head_scores
+  // Shared memory: query_fp8 + per-warp topk scores + per-warp topk indices
   constexpr uint32_t kNumWarps = kBlockSize / 32;
   const size_t smem_bytes =
       kNumKvHeads * kHeadDim * sizeof(fp8_e4m3_t)  // query cache (FP8 for bandwidth efficiency!)
-      + kTopK * sizeof(float)                       // topk scores
-      + kTopK * sizeof(int32_t)                     // topk indices
-      + kNumWarps * sizeof(float);                  // head scores accumulator
+      + (kNumWarps * kTopK) * sizeof(float)         // per-warp topk scores
+      + (kNumWarps * kTopK) * sizeof(int32_t);      // per-warp topk indices
 
   // scores_debug may be an empty (0-element) tensor if not needed
   float* scores_debug_ptr = nullptr;
@@ -432,100 +536,171 @@ void fused_score_topk_count(
   // Optimal path: bf16 queries + fp8 centroids
   const bool is_centroid_fp8 = (centroid_dtype.code == kDLFloat8_e4m3fn);
 
-  // Debug logging
-  printf("[DEBUG CUDA] query_dtype: code=%d bits=%d, centroid_dtype: code=%d bits=%d, is_fp8=%d\n",
-         query_dtype.code, query_dtype.bits, centroid_dtype.code, centroid_dtype.bits, is_centroid_fp8);
-
   if (query_dtype.code == kDLBfloat && query_dtype.bits == 16) {
     // BF16 queries
     if (is_centroid_fp8) {
       // FP8 centroids (optimal path!)
-      printf("[DEBUG CUDA] Dispatching bf16 × fp8 kernel\n");
-      LaunchKernel(bs, kBlockSize, device, smem_bytes)(
-          fused_score_topk_count_kernel<bf16_t, fp8_e4m3_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize>,
+      LaunchKernel(num_schedule_blocks, kBlockSize, device, smem_bytes)(
+          score_partial_topk_kernel<bf16_t, fp8_e4m3_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize, kChunksPerTile>,
           static_cast<const bf16_t*>(queries.data_ptr()),
           static_cast<const fp8_e4m3_t*>(centroids.data_ptr()),
           static_cast<const int32_t*>(chunk_offsets.data_ptr()),
+          static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
+          static_cast<const int32_t*>(schedule_offsets.data_ptr()),
+          static_cast<const int32_t*>(schedule_req_indices.data_ptr()),
+          static_cast<const int32_t*>(schedule_tile_indices.data_ptr()),
+          scaling,
+          static_cast<float*>(partial_topk_scores.data_ptr()),
+          static_cast<int32_t*>(partial_topk_indices.data_ptr()),
+          scores_debug_ptr);
+      LaunchKernel(bs, 1, device)(
+          merge_partial_topk_kernel<kTopK, kBlockSize>,
+          static_cast<const float*>(partial_topk_scores.data_ptr()),
+          static_cast<const int32_t*>(partial_topk_indices.data_ptr()),
+          static_cast<const int32_t*>(chunk_offsets.data_ptr()),
           chunk_starts_ptr, chunk_ends_ptr,
+          static_cast<const int32_t*>(tile_offsets.data_ptr()),
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
           scaling, always_include_first, always_include_recent,
           static_cast<int32_t*>(token_counts.data_ptr()),
-          static_cast<int32_t*>(topk_out.data_ptr()),
-          scores_debug_ptr);
+          static_cast<int32_t*>(topk_out.data_ptr()));
     } else {
-      // BF16 centroids (fallback)
-      printf("[DEBUG CUDA] Dispatching bf16 × bf16 kernel (FP8 not detected!)\n");
-      LaunchKernel(bs, kBlockSize, device, smem_bytes)(
-          fused_score_topk_count_kernel<bf16_t, bf16_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize>,
+      LaunchKernel(num_schedule_blocks, kBlockSize, device, smem_bytes)(
+          score_partial_topk_kernel<bf16_t, bf16_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize, kChunksPerTile>,
           static_cast<const bf16_t*>(queries.data_ptr()),
           static_cast<const bf16_t*>(centroids.data_ptr()),
           static_cast<const int32_t*>(chunk_offsets.data_ptr()),
+          static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
+          static_cast<const int32_t*>(schedule_offsets.data_ptr()),
+          static_cast<const int32_t*>(schedule_req_indices.data_ptr()),
+          static_cast<const int32_t*>(schedule_tile_indices.data_ptr()),
+          scaling,
+          static_cast<float*>(partial_topk_scores.data_ptr()),
+          static_cast<int32_t*>(partial_topk_indices.data_ptr()),
+          scores_debug_ptr);
+      LaunchKernel(bs, 1, device)(
+          merge_partial_topk_kernel<kTopK, kBlockSize>,
+          static_cast<const float*>(partial_topk_scores.data_ptr()),
+          static_cast<const int32_t*>(partial_topk_indices.data_ptr()),
+          static_cast<const int32_t*>(chunk_offsets.data_ptr()),
           chunk_starts_ptr, chunk_ends_ptr,
+          static_cast<const int32_t*>(tile_offsets.data_ptr()),
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
           scaling, always_include_first, always_include_recent,
           static_cast<int32_t*>(token_counts.data_ptr()),
-          static_cast<int32_t*>(topk_out.data_ptr()),
-          scores_debug_ptr);
+          static_cast<int32_t*>(topk_out.data_ptr()));
     }
   } else if (query_dtype.code == kDLFloat && query_dtype.bits == 16) {
     // FP16 queries
     if (is_centroid_fp8) {
-      LaunchKernel(bs, kBlockSize, device, smem_bytes)(
-          fused_score_topk_count_kernel<fp16_t, fp8_e4m3_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize>,
+      LaunchKernel(num_schedule_blocks, kBlockSize, device, smem_bytes)(
+          score_partial_topk_kernel<fp16_t, fp8_e4m3_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize, kChunksPerTile>,
           static_cast<const fp16_t*>(queries.data_ptr()),
           static_cast<const fp8_e4m3_t*>(centroids.data_ptr()),
           static_cast<const int32_t*>(chunk_offsets.data_ptr()),
+          static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
+          static_cast<const int32_t*>(schedule_offsets.data_ptr()),
+          static_cast<const int32_t*>(schedule_req_indices.data_ptr()),
+          static_cast<const int32_t*>(schedule_tile_indices.data_ptr()),
+          scaling,
+          static_cast<float*>(partial_topk_scores.data_ptr()),
+          static_cast<int32_t*>(partial_topk_indices.data_ptr()),
+          scores_debug_ptr);
+      LaunchKernel(bs, 1, device)(
+          merge_partial_topk_kernel<kTopK, kBlockSize>,
+          static_cast<const float*>(partial_topk_scores.data_ptr()),
+          static_cast<const int32_t*>(partial_topk_indices.data_ptr()),
+          static_cast<const int32_t*>(chunk_offsets.data_ptr()),
           chunk_starts_ptr, chunk_ends_ptr,
+          static_cast<const int32_t*>(tile_offsets.data_ptr()),
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
           scaling, always_include_first, always_include_recent,
           static_cast<int32_t*>(token_counts.data_ptr()),
-          static_cast<int32_t*>(topk_out.data_ptr()),
-          scores_debug_ptr);
+          static_cast<int32_t*>(topk_out.data_ptr()));
     } else {
-      LaunchKernel(bs, kBlockSize, device, smem_bytes)(
-          fused_score_topk_count_kernel<fp16_t, fp16_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize>,
+      LaunchKernel(num_schedule_blocks, kBlockSize, device, smem_bytes)(
+          score_partial_topk_kernel<fp16_t, fp16_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize, kChunksPerTile>,
           static_cast<const fp16_t*>(queries.data_ptr()),
           static_cast<const fp16_t*>(centroids.data_ptr()),
           static_cast<const int32_t*>(chunk_offsets.data_ptr()),
+          static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
+          static_cast<const int32_t*>(schedule_offsets.data_ptr()),
+          static_cast<const int32_t*>(schedule_req_indices.data_ptr()),
+          static_cast<const int32_t*>(schedule_tile_indices.data_ptr()),
+          scaling,
+          static_cast<float*>(partial_topk_scores.data_ptr()),
+          static_cast<int32_t*>(partial_topk_indices.data_ptr()),
+          scores_debug_ptr);
+      LaunchKernel(bs, 1, device)(
+          merge_partial_topk_kernel<kTopK, kBlockSize>,
+          static_cast<const float*>(partial_topk_scores.data_ptr()),
+          static_cast<const int32_t*>(partial_topk_indices.data_ptr()),
+          static_cast<const int32_t*>(chunk_offsets.data_ptr()),
           chunk_starts_ptr, chunk_ends_ptr,
+          static_cast<const int32_t*>(tile_offsets.data_ptr()),
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
           scaling, always_include_first, always_include_recent,
           static_cast<int32_t*>(token_counts.data_ptr()),
-          static_cast<int32_t*>(topk_out.data_ptr()),
-          scores_debug_ptr);
+          static_cast<int32_t*>(topk_out.data_ptr()));
     }
   } else {
     // FP32 queries (fallback)
     if (is_centroid_fp8) {
-      LaunchKernel(bs, kBlockSize, device, smem_bytes)(
-          fused_score_topk_count_kernel<float, fp8_e4m3_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize>,
+      LaunchKernel(num_schedule_blocks, kBlockSize, device, smem_bytes)(
+          score_partial_topk_kernel<float, fp8_e4m3_t, kNumKvHeads, kHeadDim, kTopK, kBlockSize, kChunksPerTile>,
           static_cast<const float*>(queries.data_ptr()),
           static_cast<const fp8_e4m3_t*>(centroids.data_ptr()),
           static_cast<const int32_t*>(chunk_offsets.data_ptr()),
+          static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
+          static_cast<const int32_t*>(schedule_offsets.data_ptr()),
+          static_cast<const int32_t*>(schedule_req_indices.data_ptr()),
+          static_cast<const int32_t*>(schedule_tile_indices.data_ptr()),
+          scaling,
+          static_cast<float*>(partial_topk_scores.data_ptr()),
+          static_cast<int32_t*>(partial_topk_indices.data_ptr()),
+          scores_debug_ptr);
+      LaunchKernel(bs, 1, device)(
+          merge_partial_topk_kernel<kTopK, kBlockSize>,
+          static_cast<const float*>(partial_topk_scores.data_ptr()),
+          static_cast<const int32_t*>(partial_topk_indices.data_ptr()),
+          static_cast<const int32_t*>(chunk_offsets.data_ptr()),
           chunk_starts_ptr, chunk_ends_ptr,
+          static_cast<const int32_t*>(tile_offsets.data_ptr()),
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
           scaling, always_include_first, always_include_recent,
           static_cast<int32_t*>(token_counts.data_ptr()),
-          static_cast<int32_t*>(topk_out.data_ptr()),
-          scores_debug_ptr);
+          static_cast<int32_t*>(topk_out.data_ptr()));
     } else {
-      LaunchKernel(bs, kBlockSize, device, smem_bytes)(
-          fused_score_topk_count_kernel<float, float, kNumKvHeads, kHeadDim, kTopK, kBlockSize>,
+      LaunchKernel(num_schedule_blocks, kBlockSize, device, smem_bytes)(
+          score_partial_topk_kernel<float, float, kNumKvHeads, kHeadDim, kTopK, kBlockSize, kChunksPerTile>,
           static_cast<const float*>(queries.data_ptr()),
           static_cast<const float*>(centroids.data_ptr()),
           static_cast<const int32_t*>(chunk_offsets.data_ptr()),
+          static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
+          static_cast<const int32_t*>(schedule_offsets.data_ptr()),
+          static_cast<const int32_t*>(schedule_req_indices.data_ptr()),
+          static_cast<const int32_t*>(schedule_tile_indices.data_ptr()),
+          scaling,
+          static_cast<float*>(partial_topk_scores.data_ptr()),
+          static_cast<int32_t*>(partial_topk_indices.data_ptr()),
+          scores_debug_ptr);
+      LaunchKernel(bs, 1, device)(
+          merge_partial_topk_kernel<kTopK, kBlockSize>,
+          static_cast<const float*>(partial_topk_scores.data_ptr()),
+          static_cast<const int32_t*>(partial_topk_indices.data_ptr()),
+          static_cast<const int32_t*>(chunk_offsets.data_ptr()),
           chunk_starts_ptr, chunk_ends_ptr,
+          static_cast<const int32_t*>(tile_offsets.data_ptr()),
           static_cast<const int32_t*>(seq_lens.data_ptr()),
           static_cast<const int32_t*>(sparse_req_mask.data_ptr()),
           scaling, always_include_first, always_include_recent,
           static_cast<int32_t*>(token_counts.data_ptr()),
-          static_cast<int32_t*>(topk_out.data_ptr()),
-          scores_debug_ptr);
+          static_cast<int32_t*>(topk_out.data_ptr()));
     }
   }
 }

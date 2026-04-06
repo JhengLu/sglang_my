@@ -12,6 +12,7 @@ Key functions:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -722,6 +723,24 @@ def unified_ragged_sparse_select(
     registered_reqs: set,
     timer=None,
     timer_prefix: str = "",
+    cached_sparse_req_indices: Optional[list] = None,
+    cached_chunk_offsets_t: Optional[torch.Tensor] = None,
+    cached_chunk_starts_flat: Optional[torch.Tensor] = None,
+    cached_chunk_ends_flat: Optional[torch.Tensor] = None,
+    cached_sparse_req_mask: Optional[torch.Tensor] = None,
+    cached_seq_lens_t: Optional[torch.Tensor] = None,
+    cached_req_pool_indices_t: Optional[torch.Tensor] = None,
+    cached_kv_indices_buffer: Optional[torch.Tensor] = None,
+    cached_kv_indptr_buffer: Optional[torch.Tensor] = None,
+    cached_token_counts_buffer: Optional[torch.Tensor] = None,
+    cached_topk_indices_buffer: Optional[torch.Tensor] = None,
+    cached_scores_debug_buffer: Optional[torch.Tensor] = None,
+    cached_partial_topk_scores_buffer: Optional[torch.Tensor] = None,
+    cached_partial_topk_indices_buffer: Optional[torch.Tensor] = None,
+    cached_tile_offsets_t: Optional[torch.Tensor] = None,
+    cached_schedule_offsets_t: Optional[torch.Tensor] = None,
+    cached_schedule_req_indices_t: Optional[torch.Tensor] = None,
+    cached_schedule_tile_indices_t: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, list]:
     """
     Unified ragged sparse selection for ALL batch sizes (DeepSeek NSA style).
@@ -734,74 +753,92 @@ def unified_ragged_sparse_select(
     bs = len(req_pool_indices)
     device = queries.device
 
-    # ---- Phase 1: Collect centroids and build ragged structure ----
-    all_centroids_list = []
-    all_centroids_scales_list = []  # For 2-bit quantization
-    chunk_starts_list = []
-    chunk_ends_list = []
-    chunks_list = []
-    chunk_offsets = [0]
-    sparse_req_indices = []
-    full_req_indices = []
-    use_2bit = True  # Try 2-bit first, fall back to fp32 if unavailable
+    def _collect_dynamic_sparse_inputs():
+        all_centroids_list = []
+        chunk_starts_list = []
+        chunk_ends_list = []
+        chunk_offsets = [0]
+        sparse_req_indices = []
 
-    for i in range(bs):
-        req_pool_idx = req_pool_indices[i]
-        seq_len = seq_lens[i]
-
-        # Try FP8 centroids first (pre-converted, no overhead!)
-        if (seq_len >= min_seq_len_for_sparse and
-            req_pool_idx in registered_reqs):
-            result_fp8 = centroid_manager.get_centroids_fp8(req_pool_idx, layer_id)
-            if result_fp8 is not None:
-                centroids_fp8, scales_fp8, chunk_starts, chunk_ends, chunks = result_fp8
-                all_centroids_list.append(centroids_fp8)
-                all_centroids_scales_list.append(scales_fp8)  # Store scales for reference
-                chunk_starts_list.append(chunk_starts)
-                chunk_ends_list.append(chunk_ends)
-                chunks_list.append(chunks)
-                chunk_offsets.append(chunk_offsets[-1] + centroids_fp8.shape[0])
-                sparse_req_indices.append(i)
-                continue
-
-            # Fallback: fp32 centroids (if FP8 not available)
-            result = centroid_manager.get_centroids_gpu(req_pool_idx, layer_id)
-            if result is not None:
-                centroids, chunk_starts, chunk_ends, chunks = result
-                all_centroids_list.append(centroids)
-                chunk_starts_list.append(chunk_starts)
-                chunk_ends_list.append(chunk_ends)
-                chunks_list.append(chunks)
-                chunk_offsets.append(chunk_offsets[-1] + centroids.shape[0])
-                sparse_req_indices.append(i)
-                continue
-
-        # Full attention for this request
-        full_req_indices.append(i)
-        chunk_offsets.append(chunk_offsets[-1])  # No chunks
-
-    # If we broke out due to 2-bit unavailable, retry with fp32
-    if not use_2bit and len(all_centroids_list) == 0:
         for i in range(bs):
             req_pool_idx = req_pool_indices[i]
             seq_len = seq_lens[i]
 
-            if (seq_len >= min_seq_len_for_sparse and
-                req_pool_idx in registered_reqs):
+            if seq_len >= min_seq_len_for_sparse and req_pool_idx in registered_reqs:
+                result_fp8 = centroid_manager.get_centroids_fp8(req_pool_idx, layer_id)
+                if result_fp8 is not None:
+                    centroids_fp8, _, chunk_starts, chunk_ends, _ = result_fp8
+                    all_centroids_list.append(centroids_fp8)
+                    chunk_starts_list.append(chunk_starts)
+                    chunk_ends_list.append(chunk_ends)
+                    chunk_offsets.append(chunk_offsets[-1] + centroids_fp8.shape[0])
+                    sparse_req_indices.append(i)
+                    continue
+
                 result = centroid_manager.get_centroids_gpu(req_pool_idx, layer_id)
                 if result is not None:
-                    centroids, chunk_starts, chunk_ends, chunks = result
+                    centroids, chunk_starts, chunk_ends, _ = result
                     all_centroids_list.append(centroids)
                     chunk_starts_list.append(chunk_starts)
                     chunk_ends_list.append(chunk_ends)
-                    chunks_list.append(chunks)
                     chunk_offsets.append(chunk_offsets[-1] + centroids.shape[0])
                     sparse_req_indices.append(i)
                     continue
 
-            # Full attention for this request
-            full_req_indices.append(i)
-            chunk_offsets.append(chunk_offsets[-1])  # No chunks
+            chunk_offsets.append(chunk_offsets[-1])
+
+        return (
+            all_centroids_list,
+            sparse_req_indices,
+            chunk_offsets,
+            chunk_starts_list,
+            chunk_ends_list,
+        )
+
+    # ---- Phase 1: Collect centroids and build ragged structure ----
+    use_cached_selection = (
+        cached_sparse_req_indices is not None
+        and cached_chunk_offsets_t is not None
+        and cached_chunk_starts_flat is not None
+        and cached_chunk_ends_flat is not None
+        and cached_sparse_req_mask is not None
+        and cached_seq_lens_t is not None
+        and cached_req_pool_indices_t is not None
+        and cached_tile_offsets_t is not None
+        and cached_schedule_offsets_t is not None
+        and cached_schedule_req_indices_t is not None
+        and cached_schedule_tile_indices_t is not None
+    )
+
+    if use_cached_selection:
+        all_centroids_list = []
+        for i in cached_sparse_req_indices:
+            req_pool_idx = req_pool_indices[i]
+            result_fp8 = centroid_manager.get_centroids_fp8(req_pool_idx, layer_id)
+            if result_fp8 is not None:
+                centroids_fp8, _, _, _, _ = result_fp8
+                all_centroids_list.append(centroids_fp8)
+                continue
+
+            result = centroid_manager.get_centroids_gpu(req_pool_idx, layer_id)
+            if result is not None:
+                centroids, _, _, _ = result
+                all_centroids_list.append(centroids)
+                continue
+
+            use_cached_selection = False
+            break
+
+    if not use_cached_selection:
+        (
+            all_centroids_list,
+            sparse_req_indices,
+            chunk_offsets,
+            chunk_starts_list,
+            chunk_ends_list,
+        ) = _collect_dynamic_sparse_inputs()
+    else:
+        sparse_req_indices = cached_sparse_req_indices
 
     if len(all_centroids_list) == 0:
         # All requests use full attention
@@ -821,41 +858,85 @@ def unified_ragged_sparse_select(
     if timer:
         timer.start(f"{timer_prefix}sparse_score_topk")
 
-    # Detailed timing for profiling
-    t0 = cuda.Event(enable_timing=True)
-    t1 = cuda.Event(enable_timing=True)
-    t2 = cuda.Event(enable_timing=True)
-    t3 = cuda.Event(enable_timing=True)
-    t4 = cuda.Event(enable_timing=True)
+    detailed_timing = os.environ.get("TREE_SPARSE_VERBOSE_KERNEL_TIMING", "0") == "1"
+    if detailed_timing:
+        t0 = cuda.Event(enable_timing=True)
+        t1 = cuda.Event(enable_timing=True)
+        t2 = cuda.Event(enable_timing=True)
+        t3 = cuda.Event(enable_timing=True)
+        t4 = cuda.Event(enable_timing=True)
 
-    t0.record()
+        t0.record()
 
     # Prepare inputs for CUDA kernel
-    chunk_offsets_t = torch.tensor(chunk_offsets, dtype=torch.int32, device=device)
+    if use_cached_selection:
+        chunk_offsets_t = cached_chunk_offsets_t
+        sparse_req_mask = cached_sparse_req_mask
+        seq_lens_t = cached_seq_lens_t
+        req_pool_indices_t = cached_req_pool_indices_t
+        chunk_starts_flat = cached_chunk_starts_flat
+        chunk_ends_flat = cached_chunk_ends_flat
+        tile_offsets_t = cached_tile_offsets_t
+        schedule_offsets_t = cached_schedule_offsets_t
+        schedule_req_indices_t = cached_schedule_req_indices_t
+        schedule_tile_indices_t = cached_schedule_tile_indices_t
+    else:
+        chunk_offsets_t = torch.tensor(chunk_offsets, dtype=torch.int32, device=device)
+        sparse_req_mask = torch.zeros(bs, dtype=torch.int32, device=device)
+        for idx in sparse_req_indices:
+            sparse_req_mask[idx] = 1
+        seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        req_pool_indices_t = torch.tensor(req_pool_indices, dtype=torch.int32, device=device)
+        chunk_starts_flat = (
+            chunk_starts_list[0]
+            if len(chunk_starts_list) == 1
+            else torch.cat(chunk_starts_list, dim=0)
+        )
+        chunk_ends_flat = (
+            chunk_ends_list[0]
+            if len(chunk_ends_list) == 1
+            else torch.cat(chunk_ends_list, dim=0)
+        )
+        tile_offsets = [0]
+        schedule_req_indices = []
+        schedule_tile_indices = []
+        for req_idx in range(bs):
+            num_chunks = chunk_offsets[req_idx + 1] - chunk_offsets[req_idx]
+            num_tiles = (num_chunks + 31) // 32
+            tile_offsets.append(tile_offsets[-1] + num_tiles)
+            for tile_idx in range(num_tiles):
+                schedule_req_indices.append(req_idx)
+                schedule_tile_indices.append(tile_idx)
+        total_tiles = tile_offsets[-1]
+        tile_offsets_t = torch.tensor(tile_offsets, dtype=torch.int32, device=device)
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        num_schedule_blocks = min(max(total_tiles, 1), num_sms)
+        schedule_offsets = [
+            (total_tiles * block_idx) // num_schedule_blocks
+            for block_idx in range(num_schedule_blocks + 1)
+        ]
+        schedule_offsets_t = torch.tensor(
+            schedule_offsets, dtype=torch.int32, device=device
+        )
+        schedule_req_indices_t = torch.tensor(
+            schedule_req_indices, dtype=torch.int32, device=device
+        )
+        schedule_tile_indices_t = torch.tensor(
+            schedule_tile_indices, dtype=torch.int32, device=device
+        )
 
     # Group queries for GQA: [bs, num_kv_heads, head_dim]
     group_size = num_qo_heads // num_kv_heads
     q_grouped = queries.view(bs, num_kv_heads, group_size, head_dim).mean(dim=2)
 
-    t1.record()
+    if detailed_timing:
+        t1.record()
 
     # Centroids are already in FP8 (pre-converted by centroid manager), just concatenate!
     # Optimize: skip concat if only one tensor (common case for bs=1)
     all_centroids = all_centroids_list[0] if len(all_centroids_list) == 1 else torch.cat(all_centroids_list, dim=0)
-
-    # Flatten chunk starts/ends from all sparse requests
-    chunk_starts_flat = chunk_starts_list[0] if len(chunk_starts_list) == 1 else torch.cat(chunk_starts_list, dim=0)
-    chunk_ends_flat = chunk_ends_list[0] if len(chunk_ends_list) == 1 else torch.cat(chunk_ends_list, dim=0)
-
-    # Build sparse_req_mask: 1 for sparse requests, 0 for full
-    sparse_req_mask = torch.zeros(bs, dtype=torch.int32, device=device)
-    for idx in sparse_req_indices:
-        sparse_req_mask[idx] = 1
-
-    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    req_pool_indices_t = torch.tensor(req_pool_indices, dtype=torch.int32, device=device)
-
-    t2.record()
+    if detailed_timing:
+        t2.record()
 
     # Call fused CUDA kernel with FP8 centroids (pre-converted, zero overhead!)
     kv_indptr, kv_indices, topk_indices = fused_sparse_select_and_build(
@@ -874,9 +955,21 @@ def unified_ragged_sparse_select(
         scaling=scaling,
         always_include_first=always_include_first,
         always_include_recent=always_include_recent,
+        kv_indices_buffer=cached_kv_indices_buffer,
+        kv_indptr_buffer=cached_kv_indptr_buffer,
+        token_counts_buffer=cached_token_counts_buffer,
+        topk_indices_buffer=cached_topk_indices_buffer,
+        scores_debug_buffer=cached_scores_debug_buffer,
+        partial_topk_scores_buffer=cached_partial_topk_scores_buffer,
+        partial_topk_indices_buffer=cached_partial_topk_indices_buffer,
+        tile_offsets=tile_offsets_t,
+        schedule_offsets=schedule_offsets_t,
+        schedule_req_indices=schedule_req_indices_t,
+        schedule_tile_indices=schedule_tile_indices_t,
     )
 
-    t3.record()
+    if detailed_timing:
+        t3.record()
 
     # Post-processing
     # Convert topk_indices [bs, top_k] to topk_ids_list for compatibility
@@ -888,22 +981,22 @@ def unified_ragged_sparse_select(
             valid_mask = req_topk >= 0
             topk_ids_list[i] = req_topk[valid_mask] if valid_mask.any() else None
 
-    t4.record()
-    t4.synchronize()
+    if detailed_timing:
+        t4.record()
+        t4.synchronize()
 
-    # Print detailed breakdown
-    prep_time = t0.elapsed_time(t1)
-    concat_time = t1.elapsed_time(t2)
-    kernel_time = t2.elapsed_time(t3)
-    post_time = t3.elapsed_time(t4)
-    total_time = t0.elapsed_time(t4)
+        prep_time = t0.elapsed_time(t1)
+        concat_time = t1.elapsed_time(t2)
+        kernel_time = t2.elapsed_time(t3)
+        post_time = t3.elapsed_time(t4)
+        total_time = t0.elapsed_time(t4)
 
-    print(f"[TIMING] sparse_score_topk breakdown:")
-    print(f"  Query prep:        {prep_time:.3f} ms")
-    print(f"  Centroid concat:   {concat_time:.3f} ms")
-    print(f"  CUDA kernel:       {kernel_time:.3f} ms")
-    print(f"  Post-processing:   {post_time:.3f} ms")
-    print(f"  TOTAL:             {total_time:.3f} ms")
+        print(f"[TIMING] sparse_score_topk breakdown:")
+        print(f"  Query prep:        {prep_time:.3f} ms")
+        print(f"  Centroid concat:   {concat_time:.3f} ms")
+        print(f"  CUDA kernel:       {kernel_time:.3f} ms")
+        print(f"  Post-processing:   {post_time:.3f} ms")
+        print(f"  TOTAL:             {total_time:.3f} ms")
 
     if timer:
         timer.stop(f"{timer_prefix}sparse_score_topk")

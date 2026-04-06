@@ -61,6 +61,30 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TreeSparseDecodeMetadata:
     decode_wrapper: BatchDecodeWithPagedKVCacheWrapper
+    selection_metadata: Optional["TreeSparseSelectionMetadata"] = None
+
+
+@dataclass
+class TreeSparseSelectionMetadata:
+    sparse_req_indices: List[int]
+    sparse_req_pool_indices: List[int]
+    seq_lens_t: torch.Tensor
+    req_pool_indices_t: torch.Tensor
+    sparse_req_mask: torch.Tensor
+    chunk_offsets_t: Optional[torch.Tensor]
+    chunk_starts_flat: Optional[torch.Tensor]
+    chunk_ends_flat: Optional[torch.Tensor]
+    kv_indices_buffer: Optional[torch.Tensor]
+    kv_indptr_buffer: Optional[torch.Tensor]
+    token_counts_buffer: Optional[torch.Tensor]
+    topk_indices_buffer: Optional[torch.Tensor]
+    scores_debug_buffer: Optional[torch.Tensor]
+    partial_topk_scores_buffer: Optional[torch.Tensor]
+    partial_topk_indices_buffer: Optional[torch.Tensor]
+    tile_offsets_t: Optional[torch.Tensor]
+    schedule_offsets_t: Optional[torch.Tensor]
+    schedule_req_indices_t: Optional[torch.Tensor]
+    schedule_tile_indices_t: Optional[torch.Tensor]
 
 
 @dataclass
@@ -373,6 +397,8 @@ class TreeSparseAttnBackend(AttentionBackend):
         # Invalidate validation cache for new decode step (will be recomputed at layer 0)
         self._cached_validation_batch_size = -1
 
+        selection_metadata = self._build_decode_selection_metadata(forward_batch)
+
         # Plan decode wrapper with full indices (default for non-sparse or layer 0 override)
         bs = forward_batch.batch_size
         seq_lens = forward_batch.seq_lens
@@ -406,11 +432,167 @@ class TreeSparseAttnBackend(AttentionBackend):
             non_blocking=True,
         )
 
+        selection_metadata.kv_indices_buffer = kv_indices
+        selection_metadata.kv_indptr_buffer = kv_indptr
+        selection_metadata.token_counts_buffer = torch.empty(
+            bs, dtype=torch.int32, device=self.device
+        )
+        selection_metadata.topk_indices_buffer = torch.empty(
+            (bs, self.top_k_chunks), dtype=torch.int32, device=self.device
+        )
+        selection_metadata.scores_debug_buffer = torch.empty(
+            0, dtype=torch.float32, device=self.device
+        )
+        total_sparse_chunks = (
+            selection_metadata.chunk_starts_flat.shape[0]
+            if selection_metadata.chunk_starts_flat is not None
+            else 0
+        )
+        if selection_metadata.tile_offsets_t is not None:
+            total_tiles = int(selection_metadata.tile_offsets_t[-1].item())
+        else:
+            total_tiles = 0
+        partial_buffer_tiles = max(1, total_tiles)
+        selection_metadata.partial_topk_scores_buffer = torch.empty(
+            (partial_buffer_tiles, self.top_k_chunks),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        selection_metadata.partial_topk_indices_buffer = torch.empty(
+            (partial_buffer_tiles, self.top_k_chunks),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
         self.forward_metadata = TreeSparseDecodeMetadata(
             decode_wrapper=self.decode_wrapper,
+            selection_metadata=selection_metadata,
         )
 
         self.decode_timer.stop("init_metadata")
+
+    def _build_decode_selection_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> TreeSparseSelectionMetadata:
+        """Cache decode-step tensors that do not change across layers."""
+        bs = forward_batch.batch_size
+        sparse_req_indices: List[int] = []
+        sparse_req_pool_indices: List[int] = []
+        chunk_offsets = [0]
+        tile_offsets = [0]
+        chunk_starts_list: List[torch.Tensor] = []
+        chunk_ends_list: List[torch.Tensor] = []
+
+        for i, (req_pool_idx, seq_len) in enumerate(
+            zip(self._decode_req_pool_indices, self._decode_seq_lens)
+        ):
+            is_sparse_candidate = (
+                seq_len >= self.min_seq_len_for_sparse
+                and req_pool_idx in self._registered_reqs
+                and self.centroid_manager.has_request(req_pool_idx)
+            )
+            if not is_sparse_candidate:
+                chunk_offsets.append(chunk_offsets[-1])
+                tile_offsets.append(tile_offsets[-1])
+                continue
+
+            chunk_tensors = self.centroid_manager.get_chunk_tensors(req_pool_idx)
+            if chunk_tensors is None:
+                chunk_offsets.append(chunk_offsets[-1])
+                tile_offsets.append(tile_offsets[-1])
+                continue
+
+            chunk_starts, chunk_ends = chunk_tensors
+            sparse_req_indices.append(i)
+            sparse_req_pool_indices.append(req_pool_idx)
+            chunk_offsets.append(chunk_offsets[-1] + chunk_starts.shape[0])
+            tile_offsets.append(tile_offsets[-1] + (chunk_starts.shape[0] + 31) // 32)
+            chunk_starts_list.append(chunk_starts)
+            chunk_ends_list.append(chunk_ends)
+
+        req_pool_indices_t = forward_batch.req_pool_indices.to(
+            device=self.device, dtype=torch.int32
+        )
+        seq_lens_t = forward_batch.seq_lens.to(device=self.device, dtype=torch.int32)
+        sparse_req_mask = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        if sparse_req_indices:
+            sparse_req_mask[
+                torch.tensor(sparse_req_indices, dtype=torch.long, device=self.device)
+            ] = 1
+
+        chunk_offsets_t = None
+        chunk_starts_flat = None
+        chunk_ends_flat = None
+        tile_offsets_t = None
+        schedule_offsets_t = None
+        schedule_req_indices_t = None
+        schedule_tile_indices_t = None
+        if sparse_req_indices:
+            chunk_offsets_t = torch.tensor(
+                chunk_offsets, dtype=torch.int32, device=self.device
+            )
+            tile_offsets_t = torch.tensor(
+                tile_offsets, dtype=torch.int32, device=self.device
+            )
+            chunk_starts_flat = (
+                chunk_starts_list[0]
+                if len(chunk_starts_list) == 1
+                else torch.cat(chunk_starts_list, dim=0)
+            )
+            chunk_ends_flat = (
+                chunk_ends_list[0]
+                if len(chunk_ends_list) == 1
+                else torch.cat(chunk_ends_list, dim=0)
+            )
+            total_tiles = tile_offsets[-1]
+            if total_tiles > 0:
+                num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+                num_schedule_blocks = min(num_sms, total_tiles)
+                schedule_offsets = [
+                    (total_tiles * block_idx) // num_schedule_blocks
+                    for block_idx in range(num_schedule_blocks + 1)
+                ]
+
+                schedule_req_indices: List[int] = []
+                schedule_tile_indices: List[int] = []
+                for req_idx in range(bs):
+                    req_tile_start = tile_offsets[req_idx]
+                    req_tile_end = tile_offsets[req_idx + 1]
+                    for tile_idx in range(req_tile_end - req_tile_start):
+                        schedule_req_indices.append(req_idx)
+                        schedule_tile_indices.append(tile_idx)
+
+                schedule_offsets_t = torch.tensor(
+                    schedule_offsets, dtype=torch.int32, device=self.device
+                )
+                schedule_req_indices_t = torch.tensor(
+                    schedule_req_indices, dtype=torch.int32, device=self.device
+                )
+                schedule_tile_indices_t = torch.tensor(
+                    schedule_tile_indices, dtype=torch.int32, device=self.device
+                )
+
+        return TreeSparseSelectionMetadata(
+            sparse_req_indices=sparse_req_indices,
+            sparse_req_pool_indices=sparse_req_pool_indices,
+            seq_lens_t=seq_lens_t,
+            req_pool_indices_t=req_pool_indices_t,
+            sparse_req_mask=sparse_req_mask,
+            chunk_offsets_t=chunk_offsets_t,
+            chunk_starts_flat=chunk_starts_flat,
+            chunk_ends_flat=chunk_ends_flat,
+            kv_indices_buffer=None,
+            kv_indptr_buffer=None,
+            token_counts_buffer=None,
+            topk_indices_buffer=None,
+            scores_debug_buffer=None,
+            partial_topk_scores_buffer=None,
+            partial_topk_indices_buffer=None,
+            tile_offsets_t=tile_offsets_t,
+            schedule_offsets_t=schedule_offsets_t,
+            schedule_req_indices_t=schedule_req_indices_t,
+            schedule_tile_indices_t=schedule_tile_indices_t,
+        )
 
     def _register_request_tree(
         self, forward_batch: ForwardBatch, batch_idx: int, req_pool_idx: int
@@ -1085,18 +1267,20 @@ class TreeSparseAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
         lid = layer.layer_id
         t = self.decode_timer
+        metadata = self.forward_metadata
+        selection_metadata = (
+            metadata.selection_metadata if metadata is not None else None
+        )
 
         # Check if any request needs sparse attention for this layer
         needs_sparse = False
-        for i in range(bs):
-            req_pool_idx = self._decode_req_pool_indices[i]
-            seq_len = self._decode_seq_lens[i]
-            if (
-                seq_len >= self.min_seq_len_for_sparse
-                and req_pool_idx in self._registered_reqs
-                and self.centroid_manager.get_centroids(req_pool_idx, layer.layer_id)
-                is not None
-            ):
+        sparse_req_pool_indices = (
+            selection_metadata.sparse_req_pool_indices
+            if selection_metadata is not None
+            else self._decode_req_pool_indices
+        )
+        for req_pool_idx in sparse_req_pool_indices:
+            if self.centroid_manager.get_centroids(req_pool_idx, layer.layer_id) is not None:
                 needs_sparse = True
                 break
 
@@ -1140,6 +1324,96 @@ class TreeSparseAttnBackend(AttentionBackend):
                 registered_reqs=self._registered_reqs,
                 timer=t,
                 timer_prefix=f"L{lid}:",
+                cached_sparse_req_indices=(
+                    selection_metadata.sparse_req_indices
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_chunk_offsets_t=(
+                    selection_metadata.chunk_offsets_t
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_chunk_starts_flat=(
+                    selection_metadata.chunk_starts_flat
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_chunk_ends_flat=(
+                    selection_metadata.chunk_ends_flat
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_sparse_req_mask=(
+                    selection_metadata.sparse_req_mask
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_seq_lens_t=(
+                    selection_metadata.seq_lens_t
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_req_pool_indices_t=(
+                    selection_metadata.req_pool_indices_t
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_kv_indices_buffer=(
+                    selection_metadata.kv_indices_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_kv_indptr_buffer=(
+                    selection_metadata.kv_indptr_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_token_counts_buffer=(
+                    selection_metadata.token_counts_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_topk_indices_buffer=(
+                    selection_metadata.topk_indices_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_scores_debug_buffer=(
+                    selection_metadata.scores_debug_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_partial_topk_scores_buffer=(
+                    selection_metadata.partial_topk_scores_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_partial_topk_indices_buffer=(
+                    selection_metadata.partial_topk_indices_buffer
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_tile_offsets_t=(
+                    selection_metadata.tile_offsets_t
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_schedule_offsets_t=(
+                    selection_metadata.schedule_offsets_t
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_schedule_req_indices_t=(
+                    selection_metadata.schedule_req_indices_t
+                    if selection_metadata is not None
+                    else None
+                ),
+                cached_schedule_tile_indices_t=(
+                    selection_metadata.schedule_tile_indices_t
+                    if selection_metadata is not None
+                    else None
+                ),
             )
 
             # Stats tracking
