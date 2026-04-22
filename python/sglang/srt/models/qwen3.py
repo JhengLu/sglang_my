@@ -138,9 +138,13 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def forward_prepare_native(self, positions, hidden_states, timer=None, lid=None):
+        if timer: timer.start(f"L{lid}:qkv_linear")
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if timer: timer.stop(f"L{lid}:qkv_linear")
+
+        if timer: timer.start(f"L{lid}:qk_norm")
         q, k = apply_qk_norm(
             q=q,
             k=k,
@@ -149,7 +153,11 @@ class Qwen3Attention(nn.Module):
             head_dim=self.head_dim,
             alt_stream=self.alt_stream,
         )
+        if timer: timer.stop(f"L{lid}:qk_norm")
+
+        if timer: timer.start(f"L{lid}:rope")
         q, k = self.rotary_emb(positions, q, k)
+        if timer: timer.stop(f"L{lid}:rope")
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -194,7 +202,7 @@ class Qwen3Attention(nn.Module):
             k_end = self.q_size + self.kv_size
             W_k = qkv_weight[k_start:k_end, :].t()
 
-        if t: t.start(f"L{lid}:qkv_proj")
+        if t: t.maybe_sync(f"L{lid}:qkv_linear")
         if (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -202,6 +210,8 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                timer=t,
+                lid=lid,
             )
         else:
             q, k, v = self.forward_prepare_npu(
@@ -209,7 +219,6 @@ class Qwen3Attention(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        if t: t.stop(f"L{lid}:qkv_proj")
 
         if get_global_server_args().rl_on_policy_target is not None:
             q = q.to(torch.bfloat16)

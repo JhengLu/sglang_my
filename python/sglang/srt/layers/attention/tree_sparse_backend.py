@@ -85,6 +85,8 @@ class TreeSparseSelectionMetadata:
     schedule_offsets_t: Optional[torch.Tensor]
     schedule_req_indices_t: Optional[torch.Tensor]
     schedule_tile_indices_t: Optional[torch.Tensor]
+    chunk_start_pages_flat: Optional[torch.Tensor] = None
+    chunk_end_pages_flat: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -142,6 +144,19 @@ class TreeSparseAttnBackend(AttentionBackend):
         )
         self.shared_selection = getattr(
             server_args, "tree_sparse_shared_selection", False
+        )
+        configured_page_size = getattr(server_args, "page_size", 1) or 1
+        env_promote_page_size = os.environ.get("TREE_SPARSE_PROMOTE_PAGE_SIZE")
+        self.promote_page_size = max(
+            1,
+            int(
+                env_promote_page_size
+                if env_promote_page_size is not None
+                else (configured_page_size if configured_page_size > 1 else 64)
+            ),
+        )
+        self.enable_page_stats = (
+            os.environ.get("TREE_SPARSE_PAGE_STATS", "1") == "1"
         )
 
         # Cached sparse indices for shared-selection mode (computed at layer 0, reused by all layers)
@@ -230,6 +245,8 @@ class TreeSparseAttnBackend(AttentionBackend):
         self._full_layer_count = 0
         self._total_tokens_attended = 0
         self._total_tokens_full = 0
+        self._total_promoted_tokens = 0
+        self._total_promoted_pages = 0
         self._log_interval = 40  # Log stats every N decode steps
         self._logged_optimization_active = False  # One-time log for centroid optimization
 
@@ -257,6 +274,7 @@ class TreeSparseAttnBackend(AttentionBackend):
             f"min_seq_len={self.min_seq_len_for_sparse}, "
             f"chunk_size=[{self.min_chunk_size}, {self.max_chunk_size}], "
             f"recent={self.always_include_recent}, "
+            f"promote_page_size={self.promote_page_size}, "
             f"selection={selection_mode}"
         )
 
@@ -482,6 +500,8 @@ class TreeSparseAttnBackend(AttentionBackend):
         tile_offsets = [0]
         chunk_starts_list: List[torch.Tensor] = []
         chunk_ends_list: List[torch.Tensor] = []
+        chunk_start_pages_list: List[torch.Tensor] = []
+        chunk_end_pages_list: List[torch.Tensor] = []
 
         for i, (req_pool_idx, seq_len) in enumerate(
             zip(self._decode_req_pool_indices, self._decode_seq_lens)
@@ -503,12 +523,19 @@ class TreeSparseAttnBackend(AttentionBackend):
                 continue
 
             chunk_starts, chunk_ends = chunk_tensors
+            chunk_page_tensors = self.centroid_manager.get_chunk_page_tensors(
+                req_pool_idx, self.promote_page_size
+            )
             sparse_req_indices.append(i)
             sparse_req_pool_indices.append(req_pool_idx)
             chunk_offsets.append(chunk_offsets[-1] + chunk_starts.shape[0])
             tile_offsets.append(tile_offsets[-1] + (chunk_starts.shape[0] + 31) // 32)
             chunk_starts_list.append(chunk_starts)
             chunk_ends_list.append(chunk_ends)
+            if chunk_page_tensors is not None:
+                chunk_start_pages, chunk_end_pages = chunk_page_tensors
+                chunk_start_pages_list.append(chunk_start_pages)
+                chunk_end_pages_list.append(chunk_end_pages)
 
         req_pool_indices_t = forward_batch.req_pool_indices.to(
             device=self.device, dtype=torch.int32
@@ -523,6 +550,8 @@ class TreeSparseAttnBackend(AttentionBackend):
         chunk_offsets_t = None
         chunk_starts_flat = None
         chunk_ends_flat = None
+        chunk_start_pages_flat = None
+        chunk_end_pages_flat = None
         tile_offsets_t = None
         schedule_offsets_t = None
         schedule_req_indices_t = None
@@ -544,6 +573,17 @@ class TreeSparseAttnBackend(AttentionBackend):
                 if len(chunk_ends_list) == 1
                 else torch.cat(chunk_ends_list, dim=0)
             )
+            if chunk_start_pages_list:
+                chunk_start_pages_flat = (
+                    chunk_start_pages_list[0]
+                    if len(chunk_start_pages_list) == 1
+                    else torch.cat(chunk_start_pages_list, dim=0)
+                )
+                chunk_end_pages_flat = (
+                    chunk_end_pages_list[0]
+                    if len(chunk_end_pages_list) == 1
+                    else torch.cat(chunk_end_pages_list, dim=0)
+                )
             total_tiles = tile_offsets[-1]
             if total_tiles > 0:
                 num_sms = torch.cuda.get_device_properties(self.device).multi_processor_count
@@ -592,7 +632,124 @@ class TreeSparseAttnBackend(AttentionBackend):
             schedule_offsets_t=schedule_offsets_t,
             schedule_req_indices_t=schedule_req_indices_t,
             schedule_tile_indices_t=schedule_tile_indices_t,
+            chunk_start_pages_flat=chunk_start_pages_flat,
+            chunk_end_pages_flat=chunk_end_pages_flat,
         )
+
+    def _intervals_to_page_stats(
+        self,
+        intervals: List[tuple[int, int]],
+        seq_len: int,
+        page_size: Optional[int] = None,
+    ) -> dict:
+        """Convert merged token intervals into promoted-page statistics."""
+        page_size = page_size or self.promote_page_size
+        if seq_len <= 0 or not intervals:
+            return {
+                "page_ids": [],
+                "promoted_page_count": 0,
+                "promoted_token_count": 0,
+            }
+
+        page_ids: set[int] = set()
+        promoted_token_count = 0
+        for start, end in intervals:
+            start = max(0, start)
+            end = min(seq_len - 1, end)
+            if start > end:
+                continue
+            start_page = start // page_size
+            end_page = end // page_size
+            for page_id in range(start_page, end_page + 1):
+                if page_id in page_ids:
+                    continue
+                page_ids.add(page_id)
+                page_start = page_id * page_size
+                page_end = min(seq_len, page_start + page_size)
+                promoted_token_count += page_end - page_start
+
+        page_id_list = sorted(page_ids)
+        return {
+            "page_ids": page_id_list,
+            "promoted_page_count": len(page_id_list),
+            "promoted_token_count": promoted_token_count,
+        }
+
+    def _compute_promoted_page_stats(
+        self,
+        req_pool_idx: int,
+        seq_len: int,
+        topk_ids: Optional[torch.Tensor],
+        page_size: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Project selected chunks to promoted pages and compare exact vs promoted tokens."""
+        if not self.enable_page_stats or topk_ids is None or seq_len <= 0:
+            return None
+
+        chunk_tensors = self.centroid_manager.get_chunk_tensors(req_pool_idx)
+        if chunk_tensors is None:
+            return None
+
+        chunk_starts, chunk_ends = chunk_tensors
+        selected_ids = topk_ids.tolist()
+        first_count = min(self.always_include_first, seq_len)
+        recent_start = max(first_count, seq_len - self.always_include_recent)
+        intervals: List[tuple[int, int]] = []
+
+        if first_count > 0:
+            intervals.append((0, first_count - 1))
+
+        if recent_start < seq_len:
+            intervals.append((recent_start, seq_len - 1))
+
+        for chunk_id in selected_ids:
+            if chunk_id < 0 or chunk_id >= chunk_starts.shape[0]:
+                continue
+            start = int(chunk_starts[chunk_id].item())
+            end = int(chunk_ends[chunk_id].item())
+            eff_start = max(start, first_count)
+            eff_end = min(end, recent_start - 1)
+            if eff_start <= eff_end:
+                intervals.append((eff_start, eff_end))
+
+        if not intervals:
+            return {
+                "page_ids": [],
+                "promoted_page_count": 0,
+                "promoted_token_count": 0,
+                "exact_token_count": 0,
+                "token_inflation": 0,
+                "token_inflation_ratio": 1.0,
+            }
+
+        intervals.sort()
+        merged: List[tuple[int, int]] = [intervals[0]]
+        for start, end in intervals[1:]:
+            prev_start, prev_end = merged[-1]
+            if start <= prev_end + 1:
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+
+        exact_token_count = sum(end - start + 1 for start, end in merged)
+        page_stats = self._intervals_to_page_stats(
+            merged, seq_len, page_size=page_size
+        )
+        promoted_token_count = page_stats["promoted_token_count"]
+        token_inflation = promoted_token_count - exact_token_count
+        token_inflation_ratio = (
+            promoted_token_count / max(exact_token_count, 1)
+            if exact_token_count > 0
+            else 1.0
+        )
+        page_stats.update(
+            {
+                "exact_token_count": exact_token_count,
+                "token_inflation": token_inflation,
+                "token_inflation_ratio": token_inflation_ratio,
+            }
+        )
+        return page_stats
 
     def _register_request_tree(
         self, forward_batch: ForwardBatch, batch_idx: int, req_pool_idx: int
@@ -1053,6 +1210,22 @@ class TreeSparseAttnBackend(AttentionBackend):
                     avg_sparsity = (
                         1.0 - self._total_tokens_attended / max(self._total_tokens_full, 1)
                     )
+                    page_stats_str = ""
+                    if self.enable_page_stats and self._total_promoted_pages > 0:
+                        avg_exact = self._total_tokens_attended // max(
+                            self._sparse_layer_count, 1
+                        )
+                        avg_promoted_tokens = self._total_promoted_tokens // max(
+                            self._sparse_layer_count, 1
+                        )
+                        avg_promoted_pages = self._total_promoted_pages // max(
+                            self._sparse_layer_count, 1
+                        )
+                        page_stats_str = (
+                            f", avg_promoted_pages={avg_promoted_pages}, "
+                            f"avg_promoted_tokens={avg_promoted_tokens}, "
+                            f"avg_page_inflation={max(avg_promoted_tokens - avg_exact, 0)}"
+                        )
                     logger.info(
                         f"[TreeSparse] Stats ({mode_str}, last {self._log_interval} steps): "
                         f"sparse_layers={self._sparse_layer_count}, "
@@ -1060,6 +1233,7 @@ class TreeSparseAttnBackend(AttentionBackend):
                         f"avg_sparsity={avg_sparsity:.1%}, "
                         f"avg_tokens_attended={self._total_tokens_attended // max(self._sparse_layer_count, 1)}"
                         f"/{self._total_tokens_full // max(self._sparse_layer_count, 1)}"
+                        f"{page_stats_str}"
                     )
                 else:
                     logger.info(
@@ -1072,6 +1246,8 @@ class TreeSparseAttnBackend(AttentionBackend):
                 self._full_layer_count = 0
                 self._total_tokens_attended = 0
                 self._total_tokens_full = 0
+                self._total_promoted_tokens = 0
+                self._total_promoted_pages = 0
 
                 # Periodically flush JSON files
                 self._flush_json_logs()
@@ -1423,6 +1599,46 @@ class TreeSparseAttnBackend(AttentionBackend):
                     tokens_attended = kv_indptr[i + 1].item() - kv_indptr[i].item()
                     self._total_tokens_attended += tokens_attended
                     self._total_tokens_full += self._decode_seq_lens[i]
+                    page_stats = self._compute_promoted_page_stats(
+                        req_pool_idx=self._decode_req_pool_indices[i],
+                        seq_len=self._decode_seq_lens[i],
+                        topk_ids=topk_ids_list[i],
+                    )
+                    if page_stats is not None:
+                        self._total_promoted_tokens += page_stats["promoted_token_count"]
+                        self._total_promoted_pages += page_stats["promoted_page_count"]
+                        if (
+                            self._decode_step_count % self._log_interval == 0
+                            and layer.layer_id == 0
+                        ):
+                            logger.info(
+                                f"[TreeSparse] Page stats req={self._decode_req_pool_indices[i]} "
+                                f"layer={layer.layer_id}: exact_tokens={page_stats['exact_token_count']}, "
+                                f"promoted_tokens={page_stats['promoted_token_count']}, "
+                                f"promoted_pages={page_stats['promoted_page_count']}, "
+                                f"page_size={self.promote_page_size}, "
+                                f"inflation={page_stats['token_inflation']}"
+                            )
+                        req_pool_idx = self._decode_req_pool_indices[i]
+                        if req_pool_idx in self._req_json_data and layer.layer_id == 0:
+                            self._req_json_data[req_pool_idx]["decode_steps"].append(
+                                {
+                                    "decode_step": self._decode_step_count,
+                                    "layer_id": layer.layer_id,
+                                    "mode": "per-layer-page-projection",
+                                    "seq_len": self._decode_seq_lens[i],
+                                    "selected_chunk_ids": topk_ids_list[i].tolist(),
+                                    "promote_page_size": self.promote_page_size,
+                                    "selected_page_ids": page_stats["page_ids"],
+                                    "exact_token_count": page_stats["exact_token_count"],
+                                    "promoted_token_count": page_stats["promoted_token_count"],
+                                    "promoted_page_count": page_stats["promoted_page_count"],
+                                    "token_inflation": page_stats["token_inflation"],
+                                    "token_inflation_ratio": round(
+                                        page_stats["token_inflation_ratio"], 4
+                                    ),
+                                }
+                            )
 
             t.start(f"L{lid}:begin_forward")
             self.decode_wrapper.begin_forward(

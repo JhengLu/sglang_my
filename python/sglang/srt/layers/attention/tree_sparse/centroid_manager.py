@@ -88,6 +88,8 @@ class CentroidEntry:
     # Pre-computed GPU tensors for chunk boundaries (avoids Python loops in decode)
     chunk_starts: torch.Tensor = None  # [num_chunks] int32 on GPU
     chunk_ends: torch.Tensor = None  # [num_chunks] int32 on GPU (inclusive)
+    # page_size -> (chunk_start_pages, chunk_end_pages), both [num_chunks] int32 on GPU
+    chunk_pages: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     # layer_id -> [num_chunks, num_kv_heads, head_dim]
     centroids: Dict[int, torch.Tensor] = field(default_factory=dict)
     # layer_id -> [num_chunks] token counts per chunk (for incremental updates)
@@ -230,6 +232,25 @@ class CentroidManager:
         if entry is None:
             return None
         return entry.chunk_starts, entry.chunk_ends
+
+    def get_chunk_page_tensors(
+        self, req_pool_idx: int, page_size: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Return cached chunk page ranges for a request and page size."""
+        entry = self._entries.get(req_pool_idx)
+        if entry is None:
+            return None
+
+        if page_size <= 1:
+            return entry.chunk_starts, entry.chunk_ends
+
+        if page_size not in entry.chunk_pages:
+            entry.chunk_pages[page_size] = (
+                torch.div(entry.chunk_starts, page_size, rounding_mode="floor"),
+                torch.div(entry.chunk_ends, page_size, rounding_mode="floor"),
+            )
+
+        return entry.chunk_pages[page_size]
 
     def update_centroids_for_layer(
         self,

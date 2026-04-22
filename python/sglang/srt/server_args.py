@@ -145,6 +145,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
     # Sparse attention
     "tree_sparse",
+    "flashinfer_tree_sparse",
 ]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]

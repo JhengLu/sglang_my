@@ -38,6 +38,16 @@ class DecodeStepTimer:
         self.log_interval = int(
             os.environ.get("TREE_SPARSE_TIMING_INTERVAL", "10")
         )
+        # Sync modes (to get accurate per-op timing on Blackwell GPUs
+        # where PDL causes same-stream kernel overlap):
+        #   TREE_SPARSE_TIMING_SYNC_ALL=1  — sync before every start()
+        #   TREE_SPARSE_TIMING_SYNC_OPS=op1,op2  — sync before specific ops
+        self.sync_all = os.environ.get("TREE_SPARSE_TIMING_SYNC_ALL", "0") == "1"
+        self.sync_ops: set = set()
+        sync_env = os.environ.get("TREE_SPARSE_TIMING_SYNC_OPS", "")
+        if sync_env:
+            self.sync_ops = {op.strip() for op in sync_env.split(",") if op.strip()}
+
         self._step_count = 0
 
         # Current step state
@@ -52,9 +62,14 @@ class DecodeStepTimer:
         self._history: Dict[str, List[float]] = defaultdict(list)
 
         if self.enabled:
+            sync_mode = (
+                "SYNC ALL ops" if self.sync_all
+                else f"SYNC ops: {self.sync_ops}" if self.sync_ops
+                else "no sync (raw CUDA events)"
+            )
             logger.info(
                 f"[DecodeTimer] ENABLED (TREE_SPARSE_TIMING=1, "
-                f"report every {self.log_interval} steps)"
+                f"report every {self.log_interval} steps, {sync_mode})"
             )
 
     def start_total(self):
@@ -76,15 +91,42 @@ class DecodeStepTimer:
         Call this at the end of model_runner.forward_decode() so the total
         captures only model forward time.  finish_step() is called later
         from the scheduler after scheduler-level events are recorded.
+
+        We synchronize before taking the wall-clock snapshot so that the
+        total reflects actual GPU execution time, consistent with the
+        per-layer CUDA event timers.  Without this, asynchronous kernel
+        execution can make the wall-clock total *smaller* than the sum of
+        CUDA-event component times at large batch sizes.
         """
         if not self.enabled or self._total_wall_start <= 0:
             return
+        torch.cuda.synchronize()
         self._total_wall_end = time.perf_counter()
+
+    def maybe_sync(self, name: str):
+        """Optionally synchronize GPU before the next start event.
+
+        If the op (stripped of the "L{id}:" prefix) is in self.sync_ops,
+        call torch.cuda.synchronize() to drain the pipeline.  This lets
+        you measure true kernel duration for selected ops by eliminating
+        overlap from the previous op.  Expensive — use only for diagnosis.
+
+        Controlled by env var TREE_SPARSE_TIMING_SYNC_OPS (comma-separated).
+        E.g. TREE_SPARSE_TIMING_SYNC_OPS=qkv_linear,mlp
+        """
+        if not self.enabled:
+            return
+        # Strip "L{id}:" prefix to match op name
+        op = name.split(":", 1)[1] if ":" in name else name
+        if op in self.sync_ops:
+            torch.cuda.synchronize()
 
     def start(self, name: str):
         """Record the start of a named interval."""
         if not self.enabled:
             return
+        if self.sync_all:
+            torch.cuda.synchronize()
         ev = torch.cuda.Event(enable_timing=True)
         ev.record()
         self._pending_starts[name] = ev
@@ -139,7 +181,7 @@ class DecodeStepTimer:
     # Fine-grained op categories — every op must be listed explicitly.
     # If a new op appears that is NOT listed here, it shows as "UNCLASSIFIED"
     # so you can immediately see it and decide where it belongs.
-    ATTN_PROJ_OPS = {"input_ln", "qkv_proj", "o_proj"}
+    ATTN_PROJ_OPS = {"input_ln", "qkv_proj", "qkv_linear", "qk_norm", "rope", "o_proj"}
     KV_CACHE_OPS = {"kv_cache_save", "kv_cache_load"}
     ATTENTION_OPS = {"attention", "begin_forward"}
     SPARSE_SELECTION_OPS = {
@@ -147,6 +189,7 @@ class DecodeStepTimer:
         "sparse_build_mask", "sparse_extract_indices",
         "sparse_batch_meta", "sparse_build_indices",
         "centroid_update",
+        "page_projection", "page_plan_build", "page_bridge_expand",
     }
     MLP_BLOCK_OPS = {"post_attn_ln", "mlp"}
 

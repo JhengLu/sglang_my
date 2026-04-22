@@ -91,6 +91,15 @@ def create_tree_sparse_backend(runner):
     return TreeSparseAttnBackend(runner)
 
 
+@register_attention_backend("flashinfer_tree_sparse")
+def create_flashinfer_tree_sparse_backend(runner):
+    from sglang.srt.layers.attention.flashinfer_tree_sparse_backend import (
+        FlashInferTreeSparseAttnBackend,
+    )
+
+    return FlashInferTreeSparseAttnBackend(runner)
+
+
 @register_attention_backend("triton")
 def create_triton_backend(runner):
     assert not runner.model_config.is_encoder_decoder, (
